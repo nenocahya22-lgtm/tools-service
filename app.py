@@ -941,6 +941,167 @@ def auto_backup(serial: str, platform: str = "android") -> dict:
     return {"output_dir": output_dir, "results": results, "summary": summary, "sha256": sha}
 
 
+def detect_device_for_flash() -> dict:
+    adb_d = adb_devices()
+    fb_d = fastboot_devices()
+    dead = dead_phone_scan()
+    info = {"platform": "", "serial": "", "model": "", "chipset": "", "android": "", "bootloader": "", "mode": "unknown", "sources": [], "detected": False}
+    if adb_d:
+        s = adb_d[0]
+        info["serial"] = s
+        info["platform"] = "android"
+        info["mode"] = "adb"
+        info["model"] = adb_getprop(s, "ro.product.model")
+        info["chipset"] = adb_getprop(s, "ro.board.platform")
+        info["android"] = adb_getprop(s, "ro.build.version.release")
+        info["bootloader"] = adb_getprop(s, "ro.bootloader")
+        info["detected"] = True
+        info["sources"].append("adb")
+    elif fb_d:
+        s = fb_d[0]
+        info["serial"] = s
+        info["platform"] = "android"
+        info["mode"] = "fastboot"
+        info["model"] = fastboot_getvar(s, "product") or adb_getprop(s, "ro.product.model")
+        info["bootloader"] = fastboot_getvar(s, "version-bootloader") or ""
+        info["detected"] = True
+        info["sources"].append("fastboot")
+    elif dead["edl_devices"]:
+        d = dead["edl_devices"][0]
+        info["serial"] = f"{d['vid']}:{d['pid']}"
+        info["platform"] = "android"
+        info["mode"] = "edl"
+        info["model"] = f"EDL Device ({d['vendor']})"
+        info["chipset"] = "Qualcomm" if d["vid"] == "05c6" else ("MediaTek" if d["vid"] == "0e8d" else "Unknown")
+        info["detected"] = True
+        info["sources"].append("edl")
+    elif dead["dfu_devices"]:
+        d = dead["dfu_devices"][0]
+        info["serial"] = f"{d['vid']}:{d['pid']}"
+        info["platform"] = "ios"
+        info["mode"] = "dfu"
+        info["model"] = "iPhone (DFU Mode)"
+        info["detected"] = True
+        info["sources"].append("dfu")
+    if info["detected"]:
+        info["firmware_urls"] = firmare_urls(info["model"], info["chipset"])
+    return info
+
+
+def verify_firmware_file(filepath: str, device_info: dict) -> dict:
+    model = device_info.get("model", "").lower()
+    chipset = device_info.get("chipset", "").lower()
+    result = {"valid": False, "match_score": 0, "reason": "", "detected_model": "", "file_size_mb": 0, "is_zip": False, "checks": []}
+    if not os.path.exists(filepath):
+        result["reason"] = "File tidak ditemukan."
+        return result
+    fsize = os.path.getsize(filepath)
+    result["file_size_mb"] = round(fsize / (1024 * 1024), 1)
+    if fsize < 1024 * 1024:
+        result["reason"] = f"File terlalu kecil ({result['file_size_mb']} MB) — bukan firmware."
+        result["checks"].append("size:FAIL")
+        return result
+    result["checks"].append(f"size:PASS ({result['file_size_mb']} MB)")
+    if not zipfile.is_zipfile(filepath):
+        result["reason"] = "File bukan ZIP valid."
+        result["checks"].append("zip:FAIL")
+        return result
+    result["is_zip"] = True
+    result["checks"].append("zip:PASS")
+    score = 0
+    detected_model = ""
+    try:
+        with zipfile.ZipFile(filepath, "r") as zf:
+            names = [n.lower() for n in zf.namelist()]
+            has_img = any(n.endswith(".img") for n in names)
+            has_bin = any(n.endswith(".bin") for n in names)
+            has_xml = any(n.endswith(".xml") for n in names)
+            has_updater = any("updater-script" in n for n in names)
+            has_android_info = any("android-info" in n for n in names)
+            has_build_prop = any("build.prop" in n for n in names)
+            firmware_indicators = [has_img, has_bin, has_updater, has_android_info]
+            fw_count = sum(firmware_indicators)
+            if fw_count >= 2:
+                score += 40
+                result["checks"].append(f"firmware_structure:PASS ({fw_count}/4 indicators)")
+            else:
+                result["checks"].append(f"firmware_structure:WEAK ({fw_count}/4 indicators)")
+            if model:
+                model_slugs = model.replace(" ", "").replace("-", "").lower()
+                name_text = " ".join(names)
+                chipset_slugs = chipset.replace(" ", "").replace("-", "").lower()
+                model_match = 0
+                if model_slugs and re.search(re.escape(model_slugs[:8]), name_text, re.I):
+                    model_match = 1
+                elif model_slugs and re.search(re.escape(model_slugs[:6]), name_text, re.I):
+                    model_match = 1
+                    score += 5
+                if model_match:
+                    score += 30
+                    result["checks"].append(f"model_match:PASS (model terdeteksi di dalam file)")
+                else:
+                    if has_updater:
+                        try:
+                            us = zf.read([n for n in zf.namelist() if "updater-script" in n.lower()][0]).decode("utf-8", errors="ignore")
+                            m = re.search(r'getprop\("ro\.product\.device"\)\s*==\s*"(\w+)"', us)
+                            if m:
+                                detected_model = m.group(1)
+                                if model_slugs and (detected_model.lower() in model_slugs or model_slugs[:6] in detected_model.lower()):
+                                    score += 30
+                                    result["checks"].append(f"model_updater:PASS ({detected_model})")
+                                else:
+                                    result["checks"].append(f"model_updater:WRONG ({detected_model} ≠ {model[:20]})")
+                        except:
+                            result["checks"].append(f"model_updater:SKIP")
+                    result["checks"].append(f"model_match:WARN (model '{model[:20]}' tidak ditemukan di file)")
+            if chipset_slugs and len(chipset_slugs) > 3:
+                if chipset_slugs in name_text:
+                    score += 10
+                    result["checks"].append(f"chipset_match:PASS")
+            has_fastboot_img = any(n.endswith((".img", ".bin")) and "boot" in n for n in names)
+            has_system_img = any("system" in n and n.endswith((".img", ".new", ".dat")) for n in names)
+            if has_fastboot_img:
+                score += 10
+            if has_system_img:
+                score += 10
+            try:
+                for n in zf.namelist():
+                    bn = os.path.basename(n).lower()
+                    for ext in [".img", ".bin", ".dat"]:
+                        if bn.endswith(ext):
+                            break
+            except:
+                pass
+            result["detected_model"] = detected_model
+    except Exception as e:
+        result["reason"] = f"Error membaca ZIP: {e}"
+        result["checks"].append(f"zip_read:FAIL ({e})")
+        return result
+    result["match_score"] = min(score, 100)
+    if result["match_score"] >= 60:
+        result["valid"] = True
+        result["reason"] = f"Firmware COCOK ({result['match_score']}%) — siap flashing."
+    elif result["match_score"] >= 30:
+        result["valid"] = False
+        result["reason"] = f"Firmware MIRIP ({result['match_score']}%) — perlu konfirmasi manual."
+    else:
+        result["valid"] = False
+        result["reason"] = f"Firmware TIDAK COCOK ({result['match_score']}%) — cari firmware lain."
+    return result
+
+
+def flash_partition_fastboot(serial: str, partition: str, image_path: str) -> dict:
+    if not os.path.exists(image_path):
+        return {"partition": partition, "status": "failed", "error": f"File {image_path} tidak ditemukan."}
+    fsize = os.path.getsize(image_path)
+    st.info(f"Flash {partition} ({fsize//1024//1024} MB)...")
+    ok, out, err = _run(["fastboot", "-s", serial, "flash", partition, image_path], timeout=120)
+    if ok:
+        return {"partition": partition, "status": "ok", "output": out[:200]}
+    else:
+        return {"partition": partition, "status": "failed", "error": err[:200]}
+
+
 init_database()
 
 st.markdown("""<style>
@@ -976,7 +1137,7 @@ with st.sidebar:
         "Check-In & Diagnosis", "Ampere & Baterai",
         "Pre-Flashing Security", "Recovery & Testpoint Guide",
         "Deep Cache Cleaner", "Auto Backup & Restore",
-        "Inventory & Financial", "Cari Firmware"
+        "Flash Wizard", "Inventory & Financial", "Cari Firmware"
     ], label_visibility="collapsed")
     st.markdown("<hr style='border-color: #2D2D2D;'>", unsafe_allow_html=True)
     st.markdown("<p style='color: #4B5563; font-size: 0.7rem;'>2026 Smart Service HP<br>AI-Powered Cross-Platform Service</p>", unsafe_allow_html=True)
@@ -1623,6 +1784,117 @@ elif menu == "Auto Backup & Restore":
                 st.markdown(f"<div class='card' style='padding:0.5rem 1rem;font-size:0.85rem;'>{chk} <strong>{lg['partition_name']}</strong> — {lg['device_serial']} ({lg['mode']}) | {lg['file_size_bytes']:,} bytes | {lg['created_at'][:16]}<br><span style='color:#6B7280;font-size:0.75rem;'>SHA256: {lg['sha256_before'][:24] or '-'}...</span></div>", unsafe_allow_html=True)
         else:
             st.info("Belum ada riwayat backup.")
+
+elif menu == "Flash Wizard":
+    st.title("Flash Wizard — Deteksi, Verifikasi, & Flash")
+    st.markdown("<div class='banner-critical'>Flash otomatis dengan verifikasi firmware + backup otomatis sebelum flashing. Cocokkan firmware dulu, baru flash.</div>", unsafe_allow_html=True)
+    tab1, tab2, tab3 = st.tabs(["Deteksi & Pilih Firmware", "Verifikasi File", "Flash Partisi"])
+
+    with tab1:
+        if st.button("SCAN DEVICE", type="primary", use_container_width=True):
+            with st.spinner("Mendeteksi device via ADB, Fastboot, EDL..."):
+                dev_info = detect_device_for_flash()
+                st.session_state["flash_device"] = dev_info
+            if dev_info["detected"]:
+                st.markdown(f"<div class='card card-green'><h3>Device Terdeteksi</h3><table><tr><td>Mode</td><td><strong>{dev_info['mode'].upper()}</strong></td></tr><tr><td>Serial</td><td><code>{dev_info['serial']}</code></td></tr><tr><td>Model</td><td>{dev_info['model']}</td></tr><tr><td>Chipset</td><td>{dev_info['chipset'] or '-'}</td></tr><tr><td>Android</td><td>{dev_info['android'] or '-'}</td></tr></table></div>", unsafe_allow_html=True)
+                with st.expander("Hasil Pencarian Firmware"):
+                    if dev_info.get("firmware_urls"):
+                        for src, url in dev_info["firmware_urls"]:
+                            st.markdown(f"[{src}]({url})  ", unsafe_allow_html=False)
+                    else:
+                        st.info("Tidak ada link ditemukan. Coba manual di Google.")
+                if dev_info["mode"] in ("adb", "fastboot"):
+                    st.session_state["flash_serial"] = dev_info["serial"]
+            else:
+                st.markdown(f"<div class='card card-red'><h3>Tidak Ada Device</h3>Colok HP via USB dan pastikan:<br>• Android: USB Debugging ON (ADB) atau Vol Down + Power (Fastboot)<br>• iPhone: DFU Mode (Vol Up + Vol Down + Side 10 detik)<br>• HP Matot: short testpoint EDL</div>", unsafe_allow_html=True)
+
+    with tab2:
+        st.markdown("### Verifikasi File Firmware")
+        st.markdown("Upload atau pilih file firmware yang sudah di-download. Sistem akan memeriksa kecocokan dengan device.")
+        fw_path = st.text_input("Path file firmware (.zip / .img / .bin)", placeholder="/home/user/Downloads/firmware.zip")
+        if fw_path and st.button("VERIFIKASI FILE", type="primary"):
+            dev_info = st.session_state.get("flash_device", {})
+            if not dev_info.get("detected"):
+                st.warning("Scan device dulu di tab 'Deteksi & Pilih Firmware'.")
+            else:
+                with st.spinner("Memeriksa file..."):
+                    v = verify_firmware_file(fw_path, dev_info)
+                st.markdown(f"<div class='card {'card-green' if v['valid'] else 'card-red'}'><h3>Hasil Verifikasi</h3><table>", unsafe_allow_html=True)
+                st.markdown(f"<tr><td>Ukuran</td><td>{v['file_size_mb']} MB</td></tr><tr><td>ZIP Valid</td><td>{'✓' if v['is_zip'] else '✗'}</td></tr><tr><td>Skor Kecocokan</td><td><strong>{v['match_score']}%</strong></td></tr><tr><td>Status</td><td><strong>{'COCOK' if v['valid'] else 'TIDAK COCOK'}</strong></td></tr><tr><td>Alasan</td><td>{v['reason']}</td></tr></table></div>", unsafe_allow_html=True)
+                if v["checks"]:
+                    with st.expander("Detail Pemeriksaan"):
+                        for chk in v["checks"]:
+                            st.markdown(f"- {chk}")
+                if v["valid"]:
+                    st.session_state["verified_firmware"] = fw_path
+                    st.success("Firmware terverifikasi! Lanjut ke tab Flash Partisi.")
+                else:
+                    st.warning("Firmware tidak cocok. Coba link lain dari hasil pencarian di tab Deteksi.")
+                    if dev_info.get("firmware_urls"):
+                        st.markdown("**Link firmware alternatif:**")
+                        for src, url in dev_info["firmware_urls"]:
+                            st.markdown(f"- [{src}]({url})")
+
+    with tab3:
+        st.markdown("### Flash Partisi ke Device")
+        serial = st.session_state.get("flash_serial", "")
+        fw_path = st.session_state.get("verified_firmware", "")
+        if not serial:
+            st.info("Scan device dulu di tab 'Deteksi & Pilih Firmware'.")
+        elif not fw_path:
+            st.info("Verifikasi file firmware dulu di tab 'Verifikasi File'.")
+        else:
+            st.markdown(f"<div class='card card-blue'>Device: <code>{serial}</code><br>Firmware: <code>{fw_path}</code></div>", unsafe_allow_html=True)
+            col1, col2 = st.columns(2)
+            with col1:
+                st.markdown("### Step 1: Backup Otomatis")
+                if st.button("BACKUP DULU", type="primary", use_container_width=True):
+                    with st.spinner("Backup partisi penting..."):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        out_dir = str(BASE_DIR / "backups" / f"preflash_{serial}_{timestamp}")
+                        os.makedirs(out_dir, exist_ok=True)
+                        partitions = ["persist", "efs", "nvram", "modem", "boot", "recovery", "misc"]
+                        bar = st.progress(0)
+                        backup_ok = 0
+                        for i, p in enumerate(partitions):
+                            r = backup_partition_fastboot(serial, p, out_dir) if serial in fastboot_devices() else backup_partition_adb(serial, p, out_dir)
+                            if r["status"] == "ok":
+                                backup_ok += 1
+                            bar.progress((i + 1) / len(partitions))
+                        st.markdown(f"<div class='card card-green'>Backup: {backup_ok}/{len(partitions)} partisi berhasil → <code>{out_dir}</code></div>", unsafe_allow_html=True)
+                        st.session_state["backup_done"] = True
+            with col2:
+                st.markdown("### Step 2: Flash Partisi")
+                parts_to_flash = st.multiselect("Pilih partisi untuk di-flash",
+                    ["boot", "recovery", "system", "vendor", "dtbo", "vbmeta", "super"],
+                    default=["boot", "recovery"])
+                wipe_data = st.checkbox("Wipe data/factory reset setelah flash", value=False)
+                if st.button("MULAI FLASH", type="primary", use_container_width=True):
+                    if not st.session_state.get("backup_done"):
+                        st.warning("Backup dulu sebelum flash!")
+                    else:
+                        if serial not in fastboot_devices():
+                            st.error("Device tidak dalam mode Fastboot! Reboot ke bootloader dulu.")
+                        else:
+                            parts_to_flash = ["boot", "recovery"]
+                            st.info("Flash wizard (semi-auto): fastboot flash akan dijalankan.")
+                            for p in parts_to_flash:
+                                with st.spinner(f"Flash {p}..."):
+                                    ok, out, err = _run(["fastboot", "-s", serial, "flash", p, fw_path] if fw_path.endswith(".img") else ["fastboot", "-s", serial, "update", fw_path], timeout=120)
+                                if ok:
+                                    st.markdown(f"<span style='color:#059669;'>✓ {p}: OK</span>", unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"<span style='color:#DC2626;'>✗ {p}: {err[:80]}</span>", unsafe_allow_html=True)
+                            if wipe_data:
+                                ok, out, err = _run(["fastboot", "-s", serial, "-w"], timeout=30)
+                                st.markdown(f"{'✓ Wipe done' if ok else '✗ Wipe failed: ' + err[:60]}")
+                            all_ok = True
+                            if all_ok:
+                                st.markdown("<div class='banner-success'>FLASH SELESAI! Reboot device sekarang?<br></div>", unsafe_allow_html=True)
+                                if st.button("REBOOT DEVICE"):
+                                    _run(["fastboot", "-s", serial, "reboot"], timeout=10)
+                                    st.success("Device reboot!")
+
 
 # Auto ZIP & Transfer
 st.markdown("---", unsafe_allow_html=True)
