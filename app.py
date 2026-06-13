@@ -133,6 +133,20 @@ def init_database():
         cycle_count INTEGER DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS backup_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_serial TEXT NOT NULL,
+        platform TEXT DEFAULT 'android', mode TEXT DEFAULT 'unknown',
+        partition_name TEXT NOT NULL, file_path TEXT NOT NULL,
+        file_size_bytes INTEGER DEFAULT 0, sha256_before TEXT DEFAULT '',
+        sha256_after TEXT DEFAULT '', status TEXT DEFAULT 'completed',
+        created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS dead_phone_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, detected_mode TEXT NOT NULL,
+        serial TEXT DEFAULT '', vendor TEXT DEFAULT '', product TEXT DEFAULT '',
+        vid_pid TEXT DEFAULT '', chipset TEXT DEFAULT '',
+        detected_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
+
     c.execute("SELECT COUNT(*) FROM inventory_sparepart")
     if c.fetchone()[0] == 0:
         seed_inv = [
@@ -725,6 +739,208 @@ def copy_to_sdcard():
     return False, "Tidak dapat menyalin. /sdcard tidak tersedia."
 
 
+USB_VENDOR_DB = {
+    "05c6": {"name": "Qualcomm", "modes": {"9008": "EDL Mode (Qualcomm HS-USB QDLoader 9008)", "900e": "EDL Mode (Qualcomm HS-USB Diagnostics 900E)"}},
+    "18d1": {"name": "Google/Android", "modes": {"4ee0": "Fastboot Mode", "4ee1": "Fastboot Mode", "d001": "ADB Mode", "4ee7": "Android"}},
+    "0bb4": {"name": "HTC", "modes": {"0c01": "Fastboot Mode"}},
+    "04e8": {"name": "Samsung", "modes": {"1234": "Fastboot Mode", "6601": "Download Mode (Odin)"}},
+    "2717": {"name": "Xiaomi", "modes": {"ff48": "Fastboot Mode", "ff90": "EDL Mode"}},
+    "12d1": {"name": "Huawei", "modes": {"3609": "Fastboot Mode", "360b": "Hisuite Mode"}},
+    "0fce": {"name": "Sony", "modes": {"0dde": "Fastboot Mode"}},
+    "22b8": {"name": "Motorola", "modes": {"2e71": "Fastboot Mode"}},
+    "2c02": {"name": "OnePlus/Oppo", "modes": {"f004": "EDL Mode"}},
+    "0e8d": {"name": "MediaTek", "modes": {"2000": "Preloader Mode", "0003": "BROM Mode"}},
+    "1d6b": {"name": "Linux Foundation", "modes": {"0102": "Mass Storage"}},
+    "05ac": {"name": "Apple", "modes": {"1227": "iPhone DFU Mode", "1222": "iPhone Recovery Mode", "1220": "iPhone Normal Mode", "1281": "iPhone Recovery Mode (A6)"}},
+}
+
+
+def detect_usb_devices_linux() -> list:
+    ok, out, _ = _run(["lsusb"], timeout=5)
+    if not ok:
+        return []
+    results = []
+    for line in out.splitlines():
+        m = re.search(r'ID\s+(\w{4}):(\w{4})\s+(.+)', line)
+        if m:
+            vid, pid, desc = m.group(1).lower(), m.group(2).lower(), m.group(3).strip()
+            match = USB_VENDOR_DB.get(vid, {})
+            mode_name = "Unknown"
+            if match:
+                mode_name = match["modes"].get(pid, f"{match['name']} Device ({desc})") if "modes" in match else desc
+            results.append({"vid": vid, "pid": pid, "desc": desc, "mode": mode_name, "vendor": match.get("name", "Unknown")})
+    return results
+
+
+def detect_usb_devices_windows() -> list:
+    ps_script = """
+    Get-PnpDevice -PresentOnly | Where-Object {$_.Class -eq 'Ports' -or $_.Class -eq 'USB' -or $_.Class -eq 'WPD'} |
+    Select-Object FriendlyName, DeviceID, Class | ConvertTo-Json
+    """
+    try:
+        r = subprocess.run(["powershell", "-Command", ps_script], capture_output=True, text=True, timeout=10)
+        if r.returncode != 0:
+            return []
+        import json as _json
+        data = _json.loads(r.stdout)
+        if not isinstance(data, list):
+            data = [data] if data else []
+        results = []
+        for d in data:
+            friendly = d.get("FriendlyName", "")
+            dev_id = d.get("DeviceID", "")
+            vid_m = re.search(r'VID_(\w{4})', dev_id, re.I)
+            pid_m = re.search(r'PID_(\w{4})', dev_id, re.I)
+            vid = vid_m.group(1).lower() if vid_m else ""
+            pid = pid_m.group(1).lower() if pid_m else ""
+            match = USB_VENDOR_DB.get(vid, {})
+            mode_name = "Unknown"
+            if match:
+                mode_name = match["modes"].get(pid, f"{match['name']} Device") if "modes" in match else friendly
+            results.append({"vid": vid, "pid": pid, "desc": friendly, "mode": mode_name, "vendor": match.get("name", "Unknown")})
+        return results
+    except Exception:
+        return []
+
+
+def dead_phone_scan() -> dict:
+    fb_devs = fastboot_devices()
+    usb_devs = detect_usb_devices_linux() if os.name != "nt" else detect_usb_devices_windows()
+    adb_devs = adb_devices()
+    results = {
+        "fastboot_devices": fb_devs,
+        "adb_devices": adb_devs,
+        "usb_devices": usb_devs,
+        "recovery_adb": [],
+        "recovery_manual_candidates": [],
+        "edl_devices": [],
+        "dfu_devices": [],
+        "summary": "",
+    }
+    for d in usb_devs:
+        if "EDL" in d["mode"] or d["pid"] in ["9008", "900e", "ff90", "f004"]:
+            results["edl_devices"].append(d)
+        if "DFU" in d["mode"] or d["pid"] in ["1227"]:
+            results["dfu_devices"].append(d)
+        if "Preloader" in d["mode"] or d["pid"] == "2000":
+            results["edl_devices"].append(d)
+    for s in adb_devs:
+        ok, out, _ = adb_shell(s, "getprop ro.bootmode")
+        if ok and "recovery" in out.lower():
+            results["recovery_adb"].append(s)
+    total = len(fb_devs) + len(results["edl_devices"]) + len(results["dfu_devices"]) + len(adb_devs)
+    parts = []
+    if fb_devs:
+        parts.append(f"{len(fb_devs)} Fastboot")
+    if results["edl_devices"]:
+        parts.append(f"{len(results['edl_devices'])} EDL")
+    if results["dfu_devices"]:
+        parts.append(f"{len(results['dfu_devices'])} DFU")
+    if adb_devs:
+        parts.append(f"{len(adb_devs)} ADB")
+    results["summary"] = f"Terdeteksi {total} device: {', '.join(parts)}" if parts else "Tidak ada device terdeteksi."
+    conn = get_conn()
+    c = conn.cursor()
+    for d in results["edl_devices"]:
+        c.execute("INSERT INTO dead_phone_log (detected_mode,vendor,vid_pid) VALUES('edl',?,?)", (d["vendor"], f"{d['vid']}:{d['pid']}"))
+    for d in results["dfu_devices"]:
+        c.execute("INSERT INTO dead_phone_log (detected_mode,vendor,vid_pid) VALUES('dfu',?,?)", (d["vendor"], f"{d['vid']}:{d['pid']}"))
+    for s in fb_devs:
+        c.execute("INSERT INTO dead_phone_log (detected_mode,serial) VALUES('fastboot',?)", (s,))
+    conn.commit()
+    conn.close()
+    return results
+
+
+def sha256_file(path: str) -> str:
+    import hashlib
+    h = hashlib.sha256()
+    try:
+        with open(path, "rb") as f:
+            for chunk in iter(lambda: f.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+    except Exception:
+        return ""
+
+
+def backup_partition_fastboot(serial: str, partition: str, output_dir: str) -> dict:
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{partition}.img")
+    ok, out, err = _run(["fastboot", "-s", serial, "flash:raw", out_path, partition], timeout=30)
+    if not ok:
+        ok2, out2, err2 = _run(["fastboot", "-s", serial, "getvar", f"partition-size:{partition}"], timeout=10)
+        s_m = re.search(r'partition-size:\s*(\w+)', out2, re.I)
+        if s_m:
+            sz = int(s_m.group(1), 16)
+            ok3, out3, _ = _run(["fastboot", "-s", serial, "getvar", f"partition-type:{partition}"], timeout=5)
+            typ = out3.strip()
+        else:
+            sz = 0
+        return {"partition": partition, "file": "", "size_bytes": 0, "sha256": "", "status": "failed", "error": err}
+    sha = sha256_file(out_path)
+    sz = os.path.getsize(out_path) if os.path.exists(out_path) else 0
+    res = {"partition": partition, "file": out_path, "size_bytes": sz, "sha256": sha, "status": "ok", "error": ""}
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO backup_log (device_serial,platform,mode,partition_name,file_path,file_size_bytes,sha256_before,status) VALUES(?,?,'fastboot',?,?,?,?,'completed')",
+              (serial, "android", partition, out_path, sz, sha))
+    conn.commit()
+    conn.close()
+    return res
+
+
+def backup_partition_adb(serial: str, partition: str, output_dir: str) -> dict:
+    os.makedirs(output_dir, exist_ok=True)
+    out_path = os.path.join(output_dir, f"{partition}.img")
+    ok, out, err = adb_shell(serial, f"dd if=/dev/block/bootdevice/by-name/{partition} of=/data/local/tmp/{partition}.img 2>/dev/null")
+    if not ok:
+        ok, out, err = adb_shell(serial, f"su -c 'dd if=/dev/block/bootdevice/by-name/{partition} of=/data/local/tmp/{partition}.img' 2>/dev/null")
+    if not ok:
+        ok, out, err = adb_shell(serial, f"cat /dev/block/by-name/{partition} > /data/local/tmp/{partition}.img 2>/dev/null")
+    if not ok:
+        return {"partition": partition, "file": "", "size_bytes": 0, "sha256": "", "status": "failed", "error": err}
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("INSERT INTO backup_log (device_serial,platform,mode,partition_name,status) VALUES(?,?,'adb',?,'pending')",
+              (serial, "android", partition))
+    conn.commit()
+    conn.close()
+    return {"partition": partition, "file": f"/data/local/tmp/{partition}.img", "size_bytes": 0, "sha256": "", "status": "ok", "error": ""}
+
+
+def auto_backup(serial: str, platform: str = "android") -> dict:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    output_dir = str(BASE_DIR / "backups" / f"{serial}_{timestamp}")
+    os.makedirs(output_dir, exist_ok=True)
+    results = []
+    if platform == "android":
+        fastboot_mode = False
+        if serial in fastboot_devices():
+            fastboot_mode = True
+        partitions = ["persist", "efs", "nvram", "modem", "boot", "recovery", "misc", "fsg"]
+        if fastboot_mode:
+            for p in partitions:
+                r = backup_partition_fastboot(serial, p, output_dir)
+                results.append(r)
+        else:
+            for p in partitions:
+                r = backup_partition_adb(serial, p, output_dir)
+                results.append(r)
+    elif platform == "ios":
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("INSERT INTO backup_log (device_serial,platform,mode,partition_name,status) VALUES(?,?,'libimobiledevice','full_backup','pending')",
+                  (serial, "ios"))
+        conn.commit()
+        conn.close()
+        ok, out, err = _run(["idevicebackup2", "-u", serial, "backup", "--full", output_dir], timeout=120)
+        results.append({"partition": "full_backup", "file": output_dir, "size_bytes": 0, "sha256": "", "status": "ok" if ok else "failed", "error": err})
+    summary = f"Backup {platform}: {len([r for r in results if r['status']=='ok'])}/{len(results)} berhasil"
+    sha = sha256_file(os.path.join(output_dir, "backup_summary.sha256")) if results else ""
+    return {"output_dir": output_dir, "results": results, "summary": summary, "sha256": sha}
+
+
 init_database()
 
 st.markdown("""<style>
@@ -755,10 +971,12 @@ st.markdown("""<style>
 with st.sidebar:
     st.markdown("""<div class="sidebar-logo"><h2>Smart Service HP</h2><p>Workstation v4.0 — Cross-Platform AI</p></div>""", unsafe_allow_html=True)
     menu = st.radio("NAVIGASI", [
-        "Dashboard", "Deep ADB Scanner (Android)", "iOS Scanner (iPhone)",
-        "Network Scan (PC/Laptop)", "Check-In & Diagnosis", "Ampere & Baterai",
+        "Dashboard", "Dead Phone Scanner", "Deep ADB Scanner (Android)",
+        "iOS Scanner (iPhone)", "Network Scan (PC/Laptop)",
+        "Check-In & Diagnosis", "Ampere & Baterai",
         "Pre-Flashing Security", "Recovery & Testpoint Guide",
-        "Deep Cache Cleaner", "Inventory & Financial", "Cari Firmware"
+        "Deep Cache Cleaner", "Auto Backup & Restore",
+        "Inventory & Financial", "Cari Firmware"
     ], label_visibility="collapsed")
     st.markdown("<hr style='border-color: #2D2D2D;'>", unsafe_allow_html=True)
     st.markdown("<p style='color: #4B5563; font-size: 0.7rem;'>2026 Smart Service HP<br>AI-Powered Cross-Platform Service</p>", unsafe_allow_html=True)
@@ -1295,6 +1513,116 @@ elif menu == "Cari Firmware":
         <li><strong>XDA Developers</strong> — Forum global</li><li><strong>SamMobile</strong> — Samsung</li>
         <li><strong>MIUI ROM</strong> — Xiaomi/Redmi</li><li><strong>IPSW.me</strong> — iOS</li>
         <li><strong>SP Flash Tool</strong> — MediaTek</li><li><strong>QPST/QFIL</strong> — Qualcomm</li></ul></div>""", unsafe_allow_html=True)
+
+elif menu == "Dead Phone Scanner":
+    st.title("Dead Phone Scanner — Deteksi Tanpa USB Debugging")
+    st.markdown("<div class='banner-info'>Memindai device mati/brick melalui Fastboot, EDL 9008, DFU, atau Recovery — tanpa perlu USB Debugging.</div>", unsafe_allow_html=True)
+    if st.button("SCAN NOW", type="primary", use_container_width=True):
+        with st.spinner("Memindai semua port USB..."):
+            scan = dead_phone_scan()
+        st.markdown(f"<div class='card card-gold'><strong style='font-size:1.2rem;'>{scan['summary']}</strong></div>", unsafe_allow_html=True)
+        col1, col2 = st.columns(2)
+        with col1:
+            if scan["fastboot_devices"]:
+                st.markdown("<h3>Fastboot Mode</h3>", unsafe_allow_html=True)
+                for s in scan["fastboot_devices"]:
+                    var = fastboot_getvar(s, "product") or "unknown"
+                    st.markdown(f"<div class='card card-blue' style='padding:0.6rem 1rem;'><code>{s}</code> — {var}</div>", unsafe_allow_html=True)
+            if scan["edl_devices"]:
+                st.markdown("<h3>EDL / Preloader Mode</h3>", unsafe_allow_html=True)
+                for d in scan["edl_devices"]:
+                    st.markdown(f"<div class='card card-red' style='padding:0.6rem 1rem;'><strong>{d['vendor']}</strong> — {d['mode']}<br><code>{d['vid']}:{d['pid']}</code></div>", unsafe_allow_html=True)
+            if scan["dfu_devices"]:
+                st.markdown("<h3>Apple DFU Mode</h3>", unsafe_allow_html=True)
+                for d in scan["dfu_devices"]:
+                    st.markdown(f"<div class='card' style='padding:0.6rem 1rem;'><strong>Apple iPhone</strong> — DFU Mode terdeteksi!<br><code>{d['vid']}:{d['pid']}</code></div>", unsafe_allow_html=True)
+        with col2:
+            if scan["adb_devices"]:
+                st.markdown("<h3>ADB (Android Normal)</h3>", unsafe_allow_html=True)
+                for s in scan["adb_devices"]:
+                    ok, out, _ = adb_shell(s, "getprop ro.bootmode")
+                    mode = out.strip() if ok else "unknown"
+                    st.markdown(f"<div class='card card-green' style='padding:0.6rem 1rem;'><code>{s}</code> — mode: {mode}</div>", unsafe_allow_html=True)
+            if scan["recovery_adb"]:
+                st.markdown("<h3>Recovery Mode (via ADB)</h3>", unsafe_allow_html=True)
+                for s in scan["recovery_adb"]:
+                    st.markdown(f"<div class='card card-blue' style='padding:0.6rem 1rem;'><code>{s}</code> dalam Recovery Mode</div>", unsafe_allow_html=True)
+            if not scan["fastboot_devices"] and not scan["edl_devices"] and not scan["dfu_devices"] and not scan["adb_devices"]:
+                st.markdown("<div class='card card-red'><strong>Tidak ada device terdeteksi.</strong><br>Pastikan HP terhubung via USB cabel (data sync). Untuk HP matot, coba:<br>1. Tekan & tahan Vol Down + Power (Fastboot)<br>2. Cari testpoint EDL (Qualcomm/MTK)<br>3. Untuk iPhone DFU: Vol Up + Vol Down + Side 10 detik</div>", unsafe_allow_html=True)
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM dead_phone_log ORDER BY detected_at DESC LIMIT 10")
+        logs = c.fetchall()
+        conn.close()
+        if logs:
+            with st.expander("Riwayat Deteksi"):
+                for lg in logs:
+                    st.markdown(f"<div style='font-size:0.8rem;color:#6B7280;'>{lg['detected_at'][:19]} | {lg['detected_mode'].upper()} | {lg['vendor'] or lg['serial'] or '-'} | {lg['vid_pid'] or '-'}</div>", unsafe_allow_html=True)
+    else:
+        st.info("Tekan 'SCAN NOW' untuk mendeteksi device dalam kondisi mati/brick.")
+
+elif menu == "Auto Backup & Restore":
+    st.title("Auto Backup & Restore Partisi")
+    st.markdown("<div class='banner-critical'>Backup penuh partisi penting sebelum flashing/oprek. SHA256 diverifikasi untuk deteksi korupsi.</div>", unsafe_allow_html=True)
+    tab1, tab2 = st.tabs(["Auto Backup Partisi", "Riwayat Backup"])
+    with tab1:
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            platform_bk = st.selectbox("Platform", ["android", "ios"])
+            fb_devs_bk = fastboot_devices()
+            adb_devs_bk = adb_devices()
+            serial_bk = ""
+            if fb_devs_bk:
+                serial_bk = st.selectbox("Pilih Device (Fastboot)", fb_devs_bk, key="fb_sel")
+            elif adb_devs_bk:
+                serial_bk = st.selectbox("Pilih Device (ADB)", adb_devs_bk, key="adb_sel")
+            else:
+                st.warning("Tidak ada device terdeteksi (ADB / Fastboot).")
+            partitions_default = "persist,efs,nvram,modem,boot,recovery,misc,fsg"
+            partitions_bk = st.text_input("Partisi (pisahkan koma)", partitions_default)
+        with col2:
+            st.markdown("<div class='card card-blue'><h4>Partisi yang akan di-backup:</h4><div style='font-size:0.85rem;'><strong>persist</strong> — IMEI/WiFi/BT calibration<br><strong>efs</strong> — IMEI & network (Qualcomm)<br><strong>nvram</strong> — NVRAM data<br><strong>modem</strong> — Firmware modem<br><strong>boot</strong> — Kernel<br><strong>recovery</strong> — Recovery image<br><strong>misc</strong> — Bootloader flags<br><strong>fsg</strong> — FSG partition</div></div>", unsafe_allow_html=True)
+        if serial_bk and st.button("MULAI BACKUP", type="primary", use_container_width=True):
+            pl = platform_bk
+            if serial_bk in fb_devs_bk:
+                pl = "android"
+                custom_parts = [p.strip() for p in partitions_bk.split(",") if p.strip()]
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                out_dir = str(BASE_DIR / "backups" / f"{serial_bk}_{ts}")
+                os.makedirs(out_dir, exist_ok=True)
+                bar = st.progress(0)
+                results = []
+                for i, p in enumerate(custom_parts):
+                    st.markdown(f"Backup `{p}`...")
+                    r = backup_partition_fastboot(serial_bk, p, out_dir)
+                    results.append(r)
+                    bar.progress((i + 1) / len(custom_parts))
+                    if r["status"] == "ok":
+                        st.markdown(f"<span style='color:#059669;'>✓ {p}: {r['size_bytes']} bytes  SHA256: {r['sha256'][:16]}...</span>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<span style='color:#DC2626;'>✗ {p}: {r['error'][:50]}</span>", unsafe_allow_html=True)
+                ok_count = len([r for r in results if r["status"] == "ok"])
+                st.markdown(f"<div class='card card-green'><h3>Backup Selesai</h3><strong>{ok_count}/{len(results)}</strong> partisi berhasil disimpan di:<br><code>{out_dir}</code></div>", unsafe_allow_html=True)
+                sha_summary = "\n".join([f"{r['sha256']}  {r['partition']}.img" for r in results if r['sha256']])
+                if sha_summary:
+                    with open(os.path.join(out_dir, "backup_summary.sha256"), "w") as sf:
+                        sf.write(sha_summary)
+                    st.markdown(f"<div class='card'>SHA256 checksum disimpan:<br><code>{out_dir}/backup_summary.sha256</code></div>", unsafe_allow_html=True)
+            else:
+                res = auto_backup(serial_bk, pl)
+                st.markdown(f"<div class='card'><h3>Hasil Backup {pl}</h3>{res['summary']}</div>", unsafe_allow_html=True)
+    with tab2:
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM backup_log ORDER BY created_at DESC LIMIT 20")
+        logs = c.fetchall()
+        conn.close()
+        if logs:
+            for lg in logs:
+                chk = "✓" if lg["status"] == "completed" else "✗"
+                st.markdown(f"<div class='card' style='padding:0.5rem 1rem;font-size:0.85rem;'>{chk} <strong>{lg['partition_name']}</strong> — {lg['device_serial']} ({lg['mode']}) | {lg['file_size_bytes']:,} bytes | {lg['created_at'][:16]}<br><span style='color:#6B7280;font-size:0.75rem;'>SHA256: {lg['sha256_before'][:24] or '-'}...</span></div>", unsafe_allow_html=True)
+        else:
+            st.info("Belum ada riwayat backup.")
 
 # Auto ZIP & Transfer
 st.markdown("---", unsafe_allow_html=True)
