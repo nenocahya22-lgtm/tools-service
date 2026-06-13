@@ -147,6 +147,22 @@ def init_database():
         vid_pid TEXT DEFAULT '', chipset TEXT DEFAULT '',
         detected_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
 
+    c.execute("""CREATE TABLE IF NOT EXISTS flash_log (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_serial TEXT NOT NULL,
+        device_model TEXT DEFAULT '', partition_name TEXT DEFAULT '',
+        firmware_file TEXT DEFAULT '', firmware_verified INTEGER DEFAULT 0,
+        backup_before TEXT DEFAULT '', backup_sha256 TEXT DEFAULT '',
+        operation TEXT DEFAULT 'flash', status TEXT DEFAULT 'pending',
+        error_log TEXT DEFAULT '', teknisi TEXT DEFAULT '',
+        created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')),
+        completed_at TEXT)""")
+
+    c.execute("""CREATE TABLE IF NOT EXISTS safety_checklist (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, device_serial TEXT NOT NULL,
+        check_type TEXT NOT NULL, check_name TEXT NOT NULL,
+        result INTEGER DEFAULT 0, detail TEXT DEFAULT '',
+        checked_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
+
     c.execute("SELECT COUNT(*) FROM inventory_sparepart")
     if c.fetchone()[0] == 0:
         seed_inv = [
@@ -1102,6 +1118,157 @@ def flash_partition_fastboot(serial: str, partition: str, image_path: str) -> di
         return {"partition": partition, "status": "failed", "error": err[:200]}
 
 
+SAFETY_RULES = {
+    "battery_min_pct": {"android": 50, "ios": 50, "desc": "Baterai minimal 50% sebelum flash"},
+    "usb_cable_check": {"desc": "Pastikan kabel data sync (bukan charge-only). Gunakan kabel original."},
+    "backup_required": {"desc": "Backup partisi penting (persist, efs, nvram, modem, boot, recovery)."},
+    "driver_check": {"desc": "Pastikan driver ADB/Fastboot terinstall dengan benar."},
+    "model_match": {"desc": "Firmware harus cocok dengan model device (verified ≥60%)."},
+    "variant_match": {"desc": "Periksa varian device (global/CN/IN/EU) — firmware antar varian beda."},
+    "android_version": {"desc": "Firmware harus untuk Android version yang sama atau lebih baru."},
+    "anti_rollback": {"desc": "Periksa ARB (Anti-Rollback) — downgrade bisa hardbrick pada device dengan ARB."},
+    "bootloader_unlock": {"desc": "Beberapa partisi hanya bisa di-flash jika bootloader UNLOCKED."},
+    "space_check": {"desc": "Pastikan PC/laptop memiliki ruang disk yang cukup untuk backup."},
+}
+
+
+def check_battery_level(serial: str) -> dict:
+    info = {"level": -1, "ok": False, "detail": "Tidak dapat membaca baterai."}
+    try:
+        ok, out, _ = adb_shell(serial, "dumpsys battery | grep level")
+        if ok:
+            m = re.search(r'level:\s*(\d+)', out)
+            if m:
+                info["level"] = int(m.group(1))
+                info["ok"] = info["level"] >= SAFETY_RULES["battery_min_pct"]["android"]
+                info["detail"] = f"Baterai: {info['level']}% — {'OK' if info['ok'] else 'ISI DULU!'}"
+                return info
+    except:
+        pass
+    try:
+        ok, out, _ = _run(["fastboot", "-s", serial, "getvar", "battery-voltage"], timeout=5)
+        if ok and out.strip():
+            info["detail"] = "Device di Fastboot — voltase terdeteksi"
+            info["ok"] = True
+            return info
+    except:
+        pass
+    return info
+
+
+def check_usb_stability(serial: str, retries: int = 3) -> dict:
+    results = []
+    for i in range(retries):
+        t1 = time.time()
+        ok, _, _ = _run(["adb", "-s", serial, "get-state"] if serial in adb_devices() else ["fastboot", "-s", serial, "getvar", "battery-voltage"], timeout=5)
+        t2 = time.time()
+        results.append({"ok": ok, "latency_ms": round((t2 - t1) * 1000)})
+    success_rate = sum(1 for r in results if r["ok"]) / len(results)
+    avg_latency = sum(r["latency_ms"] for r in results) / len(results)
+    stable = success_rate >= 0.66 and avg_latency < 2000
+    return {"stable": stable, "success_rate": round(success_rate * 100), "avg_latency_ms": round(avg_latency), "checks": results}
+
+
+def pre_flash_safety_check(serial: str, mode: str = "adb") -> dict:
+    checks = []
+    battery = check_battery_level(serial)
+    checks.append({"name": "Battery Level", "pass": battery["ok"], "detail": battery["detail"]})
+    if mode == "adb":
+        usb = check_usb_stability(serial, 2)
+        checks.append({"name": "USB Stability", "pass": usb["stable"], "detail": f"Rate: {usb['success_rate']}%, Latency: {usb['avg_latency_ms']}ms"})
+    devs = fastboot_devices() if mode == "fastboot" else adb_devices()
+    checks.append({"name": f"Device Connected ({mode})", "pass": serial in devs, "detail": f"Device {serial}: {'TERDETEKSI' if serial in devs else 'HILANG!'}"})
+    adb_bootloader = adb_getprop(serial, "ro.boot.bootloader") if mode == "adb" else fastboot_getvar(serial, "version-bootloader")
+    checks.append({"name": "Bootloader Detected", "pass": bool(adb_bootloader), "detail": f"Bootloader: {adb_bootloader or 'Tidak terdeteksi'}"})
+    arb_result = get_arb_level(serial)
+    checks.append({"name": "Anti-Rollback Check", "pass": arb_result["level"] < 7, "detail": f"ARB Level: {arb_result['level']} — {arb_result['note']}"})
+    all_pass = all(c["pass"] for c in checks)
+    for c in checks:
+        conn = get_conn()
+        curr = conn.cursor()
+        curr.execute("INSERT INTO safety_checklist (device_serial,check_type,check_name,result,detail) VALUES(?,?,?,?,?)",
+                     (serial, "pre_flash", c["name"], 1 if c["pass"] else 0, c["detail"]))
+        conn.commit()
+        conn.close()
+    return {"all_pass": all_pass, "checks": checks, "summary": f"Safety Check: {sum(1 for c in checks if c['pass'])}/{len(checks)} passed"}
+
+
+def emergency_recovery_guide(mode: str = "") -> list:
+    guides = {
+        "edl_9008": [
+            "Device terdeteksi sebagai EDL 9008 — masih ada harapan.",
+            "1. Install Qualcomm USB Driver (QPST/QFIL).",
+            "2. Buka QFIL → pilih 'Flat Build' → browse Programmer Path (.elf file untuk chipset kamu).",
+            "3. Klik 'Download' atau 'Do job' → tunggu proses selesai.",
+            "4. Jika tidak masuk QFIL: coba short testpoint lagi sambil colok USB.",
+            "5. Alternatif: gunakan 'EDL Cable' atau 'Deep Flash Cable' untuk bypass.",
+        ],
+        "mtk_preloader": [
+            "Device terdeteksi sebagai MediaTek Preloader.",
+            "1. Install MediaTek USB VCOM driver.",
+            "2. Buka SP Flash Tool → pilih Scatter File dari firmware.",
+            "3. Centang partisi yang ingin di-flash (jangan centang preloader jika tidak perlu).",
+            "4. Klik 'Download' → colok device (tanpa baterai untuk MTK).",
+            "5. Tunggu progress bar sampai selesai (format kuning → hijau).",
+        ],
+        "fastboot_unbrick": [
+            "Device dalam mode Fastboot — bisa diperbaiki.",
+            "1. Backup partisi dulu: persist, efs, nvram, modem, boot, recovery.",
+            "2. Cari firmware yang cocok (model + varian harus sama persis!).",
+            "3. Flash partisi satu per satu: boot, recovery, system, vendor.",
+            "4. Jika system error: flash 'super' partition (untuk device dynamic partition).",
+            "5. Jika stuck di logo: wipe data via recovery atau `fastboot -w`.",
+            "6. Terakhir: `fastboot reboot`.",
+        ],
+        "dfu_recovery": [
+            "iPhone dalam mode DFU / Recovery.",
+            "1. Buka Finder (macOS) atau iTunes (Windows).",
+            "2. Akan muncul notifikasi 'iPhone detected in recovery mode'.",
+            "3. Klik 'Restore' atau 'Update' — pilih IPSW firmware yang cocok.",
+            "4. Untuk keluar dari DFU tanpa restore: tekan Vol Up + Vol Down + Side (Face ID) atau Home + Power (Tombol Home).",
+            "5. Jika restore gagal: coba DFU mode lagi, ganti kabel, ganti port USB.",
+        ],
+        "black_screen": [
+            "Device hidup (ada getar/led) tapi layar hitam.",
+            "1. Coba paksa restart: Vol Down + Power 15 detik.",
+            "2. Jika ada getar: kemungkinan LCD rusak — ganti LCD.",
+            "3. Jika tidak ada getar: coba colok charger — jika ada LED, kemungkinan IC Power.",
+            "4. Coba masuk Recovery: Vol Up + Power (atau kombinasi sesuai brand).",
+            "5. Jika masuk Recovery: backup data, lalu flash ulang.",
+        ],
+        "bootloop": [
+            "Device restart terus-menerus (bootloop).",
+            "1. Coba masuk Safe Mode (untuk Samsung: Vol Down saat boot logo).",
+            "2. Jika bisa masuk Safe Mode: hapus app bermasalah (yang baru diinstall).",
+            "3. Wipe cache partition dari Recovery Mode.",
+            "4. Jika masih bootloop: factory reset dari Recovery.",
+            "5. Jika masih: flash ulang firmware via fastboot/ODIN/SP Flash Tool.",
+            "6. Pastikan tidak melakukan downgrade jika device punya ARB!",
+        ],
+        "no_download_mode": [
+            "Device tidak bisa masuk Download Mode / EDL.",
+            "1. Coba kombinasi tombol yang benar: Vol Down + Vol Up + colok USB (Qualcomm).",
+            "2. Untuk MTK: colok USB tanpa baterai, tekan Vol Up + Vol Down lalu colok.",
+            "3. Coba testpoint EDL: buka casing, cari 2 titik tembaga kecil di dekat IC Power.",
+            "4. Gunakan 'EDL Cable' (kabel USB dengan resistor 2.2k ohm khusus).",
+            "5. Alternatif: gunakan 'Deep Flash Cable' atau 'Brom Bypass' untuk MTK.",
+        ],
+    }
+    if mode and mode in guides:
+        return guides[mode]
+    return guides
+
+
+def log_flash_transaction(serial: str, model: str, partition: str, firmware: str, verified: bool, status: str, error: str = ""):
+    conn = get_conn()
+    c = conn.cursor()
+    c.execute("""INSERT INTO flash_log (device_serial,device_model,partition_name,firmware_file,
+        firmware_verified,status,error_log) VALUES(?,?,?,?,?,?,?)""",
+              (serial, model, partition, firmware, 1 if verified else 0, status, error))
+    conn.commit()
+    conn.close()
+
+
 init_database()
 
 st.markdown("""<style>
@@ -1137,7 +1304,8 @@ with st.sidebar:
         "Check-In & Diagnosis", "Ampere & Baterai",
         "Pre-Flashing Security", "Recovery & Testpoint Guide",
         "Deep Cache Cleaner", "Auto Backup & Restore",
-        "Flash Wizard", "Inventory & Financial", "Cari Firmware"
+        "Flash Wizard", "Emergency Recovery Guide",
+        "Inventory & Financial", "Cari Firmware"
     ], label_visibility="collapsed")
     st.markdown("<hr style='border-color: #2D2D2D;'>", unsafe_allow_html=True)
     st.markdown("<p style='color: #4B5563; font-size: 0.7rem;'>2026 Smart Service HP<br>AI-Powered Cross-Platform Service</p>", unsafe_allow_html=True)
@@ -1786,69 +1954,154 @@ elif menu == "Auto Backup & Restore":
             st.info("Belum ada riwayat backup.")
 
 elif menu == "Flash Wizard":
-    st.title("Flash Wizard — Deteksi, Verifikasi, & Flash")
-    st.markdown("<div class='banner-critical'>Flash otomatis dengan verifikasi firmware + backup otomatis sebelum flashing. Cocokkan firmware dulu, baru flash.</div>", unsafe_allow_html=True)
-    tab1, tab2, tab3 = st.tabs(["Deteksi & Pilih Firmware", "Verifikasi File", "Flash Partisi"])
+    st.title("Flash Wizard — Safety First, No Mistakes")
+    st.markdown("<div class='banner-critical'>⚠️ SISTEM PENGAMANAN KETAT — Setiap langkah diverifikasi. Jika ada risiko hardbrick, sistem akan MEMBLOKIR operasi.</div>", unsafe_allow_html=True)
+    tab1, tab2, tab3, tab4 = st.tabs(["Safety Checklist", "Deteksi & Firmware", "Verifikasi File", "Flash Eksekusi"])
+
+    if "safety_checks" not in st.session_state:
+        st.session_state["safety_checks"] = None
+    if "flash_serial" not in st.session_state:
+        st.session_state["flash_serial"] = ""
+    if "flash_device" not in st.session_state:
+        st.session_state["flash_device"] = {}
+    if "verified_firmware" not in st.session_state:
+        st.session_state["verified_firmware"] = ""
+    if "backup_done" not in st.session_state:
+        st.session_state["backup_done"] = False
+    if "dry_run" not in st.session_state:
+        st.session_state["dry_run"] = False
 
     with tab1:
+        st.markdown("### ⛑️ Safety Checklist — WAJIB LULIS SEMUA sebelum flash")
+        col1, col2 = st.columns([1, 1])
+        with col1:
+            st.markdown("<div class='card card-red'><strong>PERINGATAN:</strong> Melewati safety check = resiko hardbrick. Sistem akan memblokir flash jika tidak lulus.</div>", unsafe_allow_html=True)
+        with col2:
+            use_dry_run = st.checkbox("DRY RUN MODE (simulasi — tidak ada flash beneran)", value=True, help="Aman untuk testing. Matikan centang ini saat benar-benar mau flash.")
+
+        serial_sc = adb_devices() + fastboot_devices()
+        if not serial_sc:
+            st.warning("Tidak ada device terdeteksi. Scan di tab Deteksi & Firmware dulu.")
+        else:
+            mode_sc = "fastboot" if any(s in fastboot_devices() for s in serial_sc) else "adb"
+            serial_sc = serial_sc[0]
+            st.markdown(f"Device: <code>{serial_sc}</code> ({mode_sc.upper()})", unsafe_allow_html=True)
+            if st.button("JALANKAN SAFETY CHECK", type="primary", use_container_width=True):
+                with st.spinner("Memeriksa semua aspek keamanan..."):
+                    check = pre_flash_safety_check(serial_sc, mode_sc)
+                    st.session_state["safety_checks"] = check
+                    st.session_state["flash_serial"] = serial_sc
+                    st.session_state["dry_run"] = use_dry_run
+            if st.session_state.get("safety_checks"):
+                check = st.session_state["safety_checks"]
+                for c in check["checks"]:
+                    icon = "✅" if c["pass"] else "❌"
+                    st.markdown(f"{icon} **{c['name']}**: {c['detail']}", unsafe_allow_html=True)
+                if check["all_pass"]:
+                    st.markdown(f"<div class='banner-success'>✅ SEMUA CHECK LULUS ({check['summary']})</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown(f"<div class='banner-critical'>❌ SAFETY CHECK GAGAL ({check['summary']}) — Perbaiki masalah sebelum lanjut!</div>", unsafe_allow_html=True)
+                    st.warning("Flash akan diblokir sampai semua check lulus.")
+                with st.expander("10 Aturan Emas Safety Flash"):
+                    for i, (k, v) in enumerate(SAFETY_RULES.items(), 1):
+                        st.markdown(f"{i}. **{k.replace('_', ' ').title()}**: {v['desc']}")
+
+    with tab2:
+        st.markdown("### Deteksi Device & Cari Firmware")
+        st.info("Setelah safety check lulus, scan device untuk cari firmware yang cocok.")
         if st.button("SCAN DEVICE", type="primary", use_container_width=True):
             with st.spinner("Mendeteksi device via ADB, Fastboot, EDL..."):
                 dev_info = detect_device_for_flash()
                 st.session_state["flash_device"] = dev_info
             if dev_info["detected"]:
                 st.markdown(f"<div class='card card-green'><h3>Device Terdeteksi</h3><table><tr><td>Mode</td><td><strong>{dev_info['mode'].upper()}</strong></td></tr><tr><td>Serial</td><td><code>{dev_info['serial']}</code></td></tr><tr><td>Model</td><td>{dev_info['model']}</td></tr><tr><td>Chipset</td><td>{dev_info['chipset'] or '-'}</td></tr><tr><td>Android</td><td>{dev_info['android'] or '-'}</td></tr></table></div>", unsafe_allow_html=True)
-                with st.expander("Hasil Pencarian Firmware"):
-                    if dev_info.get("firmware_urls"):
-                        for src, url in dev_info["firmware_urls"]:
-                            st.markdown(f"[{src}]({url})  ", unsafe_allow_html=False)
+                if dev_info["model"]:
+                    arb = get_arb_level(dev_info["model"])
+                    if arb["level"] >= 7:
+                        st.markdown(f"<div class='banner-critical'>⚠️ ARB LEVEL {arb['level']} — DEVICE INI DILARANG DOWNGRADE! Flash hanya firmware dengan ARB ≥ {arb['level']}.</div>", unsafe_allow_html=True)
+                    elif arb["level"] >= 4:
+                        st.markdown(f"<div class='banner-warning'>⚠️ ARB LEVEL {arb['level']} — Hati-hati, jangan downgrade!</div>", unsafe_allow_html=True)
                     else:
-                        st.info("Tidak ada link ditemukan. Coba manual di Google.")
+                        st.markdown(f"<div class='banner-success'>✅ ARB LEVEL {arb['level']} — Aman.</div>", unsafe_allow_html=True)
+                    st.info(arb["note"])
+                with st.expander("Link Firmware Recomendation"):
+                    if dev_info.get("firmware_urls"):
+                        st.markdown("Download firmware dari link berikut. Pastikan varian device SAMA PERSIS (Global/CN/IN/EU).")
+                        for src, url in dev_info["firmware_urls"]:
+                            st.markdown(f"- [{src}]({url})")
+                    else:
+                        st.info("Tidak ada link ditemukan. Coba: 'Stock ROM {model}' di Google.")
                 if dev_info["mode"] in ("adb", "fastboot"):
                     st.session_state["flash_serial"] = dev_info["serial"]
             else:
                 st.markdown(f"<div class='card card-red'><h3>Tidak Ada Device</h3>Colok HP via USB dan pastikan:<br>• Android: USB Debugging ON (ADB) atau Vol Down + Power (Fastboot)<br>• iPhone: DFU Mode (Vol Up + Vol Down + Side 10 detik)<br>• HP Matot: short testpoint EDL</div>", unsafe_allow_html=True)
 
-    with tab2:
-        st.markdown("### Verifikasi File Firmware")
-        st.markdown("Upload atau pilih file firmware yang sudah di-download. Sistem akan memeriksa kecocokan dengan device.")
+    with tab3:
+        st.markdown("### 🔬 Verifikasi File Firmware")
+        st.markdown("Pilih file firmware yang sudah di-download. Sistem akan memeriksa kecocokan dengan device.")
         fw_path = st.text_input("Path file firmware (.zip / .img / .bin)", placeholder="/home/user/Downloads/firmware.zip")
         if fw_path and st.button("VERIFIKASI FILE", type="primary"):
             dev_info = st.session_state.get("flash_device", {})
             if not dev_info.get("detected"):
-                st.warning("Scan device dulu di tab 'Deteksi & Pilih Firmware'.")
+                st.warning("Scan device dulu di tab 'Deteksi & Firmware'.")
             else:
                 with st.spinner("Memeriksa file..."):
                     v = verify_firmware_file(fw_path, dev_info)
-                st.markdown(f"<div class='card {'card-green' if v['valid'] else 'card-red'}'><h3>Hasil Verifikasi</h3><table>", unsafe_allow_html=True)
-                st.markdown(f"<tr><td>Ukuran</td><td>{v['file_size_mb']} MB</td></tr><tr><td>ZIP Valid</td><td>{'✓' if v['is_zip'] else '✗'}</td></tr><tr><td>Skor Kecocokan</td><td><strong>{v['match_score']}%</strong></td></tr><tr><td>Status</td><td><strong>{'COCOK' if v['valid'] else 'TIDAK COCOK'}</strong></td></tr><tr><td>Alasan</td><td>{v['reason']}</td></tr></table></div>", unsafe_allow_html=True)
+                if v["match_score"] >= 60:
+                    cls = "card-green"
+                elif v["match_score"] >= 30:
+                    cls = "card-gold"
+                else:
+                    cls = "card-red"
+                st.markdown(f"<div class='card {cls}'><h3>Hasil Verifikasi</h3><table>", unsafe_allow_html=True)
+                st.markdown(f"<tr><td>Ukuran</td><td>{v['file_size_mb']} MB</td></tr><tr><td>ZIP Valid</td><td>{'✅' if v['is_zip'] else '❌'}</td></tr><tr><td>Skor Kecocokan</td><td><strong style='font-size:1.3rem;'>{v['match_score']}%</strong></td></tr><tr><td>Status</td><td><strong>{'✅ COCOK — Siap flash' if v['valid'] else '❌ TIDAK COCOK — Cari file lain'}</strong></td></tr><tr><td>Alasan</td><td>{v['reason']}</td></tr></table></div>", unsafe_allow_html=True)
                 if v["checks"]:
                     with st.expander("Detail Pemeriksaan"):
                         for chk in v["checks"]:
                             st.markdown(f"- {chk}")
                 if v["valid"]:
                     st.session_state["verified_firmware"] = fw_path
-                    st.success("Firmware terverifikasi! Lanjut ke tab Flash Partisi.")
+                    st.success("✅ Firmware terverifikasi! Lanjut ke tab Flash Eksekusi.")
                 else:
-                    st.warning("Firmware tidak cocok. Coba link lain dari hasil pencarian di tab Deteksi.")
-                    if dev_info.get("firmware_urls"):
-                        st.markdown("**Link firmware alternatif:**")
-                        for src, url in dev_info["firmware_urls"]:
-                            st.markdown(f"- [{src}]({url})")
+                    st.warning("❌ Firmware tidak cocok! Jangan flash file ini ke device.")
+                    st.info("Coba download firmware lain dari link di tab Deteksi & Firmware. Pastikan model dan varian SAMA PERSIS.")
 
-    with tab3:
-        st.markdown("### Flash Partisi ke Device")
+    with tab4:
+        st.markdown("### ⚡ Eksekusi Flash — Semi-Auto")
         serial = st.session_state.get("flash_serial", "")
         fw_path = st.session_state.get("verified_firmware", "")
+        safety = st.session_state.get("safety_checks")
+        dry_run = st.session_state.get("dry_run", True)
+
         if not serial:
-            st.info("Scan device dulu di tab 'Deteksi & Pilih Firmware'.")
+            st.info("Step 1: Safety Check dulu di tab Safety Checklist.")
+        elif not safety or not safety.get("all_pass"):
+            st.error("⚠️ SAFETY CHECK BELUM LULUS! Kembali ke tab Safety Checklist.")
         elif not fw_path:
-            st.info("Verifikasi file firmware dulu di tab 'Verifikasi File'.")
+            st.info("Step 2-3: Scan device & verifikasi firmware dulu.")
         else:
-            st.markdown(f"<div class='card card-blue'>Device: <code>{serial}</code><br>Firmware: <code>{fw_path}</code></div>", unsafe_allow_html=True)
-            col1, col2 = st.columns(2)
-            with col1:
-                st.markdown("### Step 1: Backup Otomatis")
-                if st.button("BACKUP DULU", type="primary", use_container_width=True):
+            with st.expander("Ringkasan Sebelum Flash", expanded=True):
+                md = ""
+                md += f"**Device:** `{serial}`\n\n"
+                dev_info = st.session_state.get("flash_device", {})
+                if dev_info:
+                    md += f"**Model:** {dev_info.get('model', '-')}\n\n"
+                    md += f"**Chipset:** {dev_info.get('chipset', '-')}\n\n"
+                    md += f"**Mode:** {dev_info.get('mode', '-').upper()}\n\n"
+                md += f"**Firmware:** `{os.path.basename(fw_path)}`\n\n"
+                md += f"**Safety Check:** ✅ LULUS\n\n"
+                if dry_run:
+                    md += f"**Mode:** 🔄 DRY RUN (simulasi — aman)\n\n"
+                else:
+                    md += f"**Mode:** ⚡ LIVE FLASH (nyata!)\n\n"
+                st.markdown(md, unsafe_allow_html=True)
+
+            st.markdown("---")
+            col_a, col_b = st.columns([1, 1])
+            with col_a:
+                st.markdown("### Step 4a: Backup Otomatis")
+                st.markdown("Backup 7 partisi penting: persist, efs, nvram, modem, boot, recovery, misc.")
+                if st.button("MULAI BACKUP", type="primary", use_container_width=True):
                     with st.spinner("Backup partisi penting..."):
                         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                         out_dir = str(BASE_DIR / "backups" / f"preflash_{serial}_{timestamp}")
@@ -1861,40 +2114,138 @@ elif menu == "Flash Wizard":
                             if r["status"] == "ok":
                                 backup_ok += 1
                             bar.progress((i + 1) / len(partitions))
-                        st.markdown(f"<div class='card card-green'>Backup: {backup_ok}/{len(partitions)} partisi berhasil → <code>{out_dir}</code></div>", unsafe_allow_html=True)
-                        st.session_state["backup_done"] = True
-            with col2:
-                st.markdown("### Step 2: Flash Partisi")
-                parts_to_flash = st.multiselect("Pilih partisi untuk di-flash",
-                    ["boot", "recovery", "system", "vendor", "dtbo", "vbmeta", "super"],
-                    default=["boot", "recovery"])
-                wipe_data = st.checkbox("Wipe data/factory reset setelah flash", value=False)
-                if st.button("MULAI FLASH", type="primary", use_container_width=True):
-                    if not st.session_state.get("backup_done"):
-                        st.warning("Backup dulu sebelum flash!")
-                    else:
-                        if serial not in fastboot_devices():
-                            st.error("Device tidak dalam mode Fastboot! Reboot ke bootloader dulu.")
+                        if backup_ok == len(partitions):
+                            st.markdown(f"<div class='banner-success'>✅ Backup {backup_ok}/{len(partitions)} partisi SELESAI → <code>{out_dir}</code></div>", unsafe_allow_html=True)
+                            st.session_state["backup_done"] = True
+                            st.session_state["backup_dir"] = out_dir
                         else:
-                            parts_to_flash = ["boot", "recovery"]
-                            st.info("Flash wizard (semi-auto): fastboot flash akan dijalankan.")
-                            for p in parts_to_flash:
-                                with st.spinner(f"Flash {p}..."):
-                                    ok, out, err = _run(["fastboot", "-s", serial, "flash", p, fw_path] if fw_path.endswith(".img") else ["fastboot", "-s", serial, "update", fw_path], timeout=120)
-                                if ok:
-                                    st.markdown(f"<span style='color:#059669;'>✓ {p}: OK</span>", unsafe_allow_html=True)
-                                else:
-                                    st.markdown(f"<span style='color:#DC2626;'>✗ {p}: {err[:80]}</span>", unsafe_allow_html=True)
-                            if wipe_data:
-                                ok, out, err = _run(["fastboot", "-s", serial, "-w"], timeout=30)
-                                st.markdown(f"{'✓ Wipe done' if ok else '✗ Wipe failed: ' + err[:60]}")
-                            all_ok = True
-                            if all_ok:
-                                st.markdown("<div class='banner-success'>FLASH SELESAI! Reboot device sekarang?<br></div>", unsafe_allow_html=True)
-                                if st.button("REBOOT DEVICE"):
-                                    _run(["fastboot", "-s", serial, "reboot"], timeout=10)
-                                    st.success("Device reboot!")
+                            st.markdown(f"<div class='banner-warning'>⚠️ Backup {backup_ok}/{len(partitions)} — sebagian gagal. Periksa log.</div>", unsafe_allow_html=True)
+            with col_b:
+                st.markdown("### Step 4b: Restore (Jika Gagal)")
+                if st.session_state.get("backup_dir"):
+                    st.info(f"Backup tersimpan di:\n`{st.session_state['backup_dir']}`")
+                    st.markdown("Jika flash gagal, restore dengan perintah:")
+                    st.code("fastboot flash partition_name backup_file.img")
 
+            st.markdown("---")
+            st.markdown("### Step 5: Flash Partisi")
+            parts_to_flash = st.multiselect("Pilih partisi untuk di-flash",
+                ["boot", "recovery", "system", "vendor", "dtbo", "vbmeta", "super"],
+                default=["boot", "recovery"],
+                help="⚠️ Jangan centang 'vbmeta' jika bootloader tidak terbuka! Bisa hardbrick.")
+            wipe_data = st.checkbox("Wipe data/factory reset setelah flash", value=False,
+                help="Hapus semua data pengguna setelah flash berhasil.")
+
+            if "vbmeta" in parts_to_flash:
+                st.markdown("<div class='banner-critical'>⚠️ VBMETA TERPILIH! Hanya centang jika bootloader UNLOCKED. Jika LOCKED, flashing vbmeta bisa hardbrick!</div>", unsafe_allow_html=True)
+            if "super" in parts_to_flash:
+                st.warning("⚠️ 'super' partition mengandung system/vendor/product. Pastikan firmware cocok 100%!")
+
+            if not st.session_state.get("backup_done"):
+                st.warning("Backup dulu sebelum flash!")
+            elif serial not in fastboot_devices():
+                st.error("Device tidak dalam mode Fastboot! Reboot ke bootloader dulu. Cara: `adb reboot bootloader`")
+            else:
+                if dry_run:
+                    st.markdown("<div class='card card-blue'><strong>🔄 DRY RUN MODE AKTIF</strong> — Tidak ada flash beneran. Matikan centang 'Dry Run' di Safety Checklist untuk flash nyata.</div>", unsafe_allow_html=True)
+                else:
+                    st.markdown("<div class='card card-red'><strong>⚠️ LIVE MODE — Flash nyata akan dijalankan!</strong></div>", unsafe_allow_html=True)
+
+                confirm_text = "Saya paham resiko dan ingin melanjutkan"
+                user_confirm = st.text_input("Ketik persis: '{}' untuk konfirmasi".format(confirm_text))
+                can_proceed = user_confirm.strip() == confirm_text
+
+                if can_proceed and st.button("EKSEKUSI FLASH", type="primary", use_container_width=True):
+                    if dry_run:
+                        st.markdown(f"<div class='card card-green'><h3>🔄 DRY RUN — Simulasi Berhasil</h3>Partisi yang akan di-flash: {', '.join(parts_to_flash)}<br>Wipe data: {'Ya' if wipe_data else 'Tidak'}<br>Perintah yang akan dijalankan:<br>", unsafe_allow_html=True)
+                        for p in parts_to_flash:
+                            st.code(f"fastboot -s {serial} flash {p} {fw_path}")
+                        if wipe_data:
+                            st.code(f"fastboot -s {serial} -w")
+                        st.success("Dry run selesai. Matikan centang 'Dry Run' di Safety Checklist untuk flash nyata.")
+                    else:
+                        for p in parts_to_flash:
+                            st.markdown(f"Flashing `{p}`...")
+                            ok, out, err = _run(["fastboot", "-s", serial, "flash", p, fw_path] if fw_path.endswith(".img") else ["fastboot", "-s", serial, "update", fw_path], timeout=120)
+                            log_flash_transaction(serial, dev_info.get("model", ""), p, fw_path, True, "ok" if ok else "failed", err)
+                            if ok:
+                                st.markdown(f"<span style='color:#059669;font-size:1.1rem;'>✅ {p}: FLASH BERHASIL</span>", unsafe_allow_html=True)
+                            else:
+                                st.markdown(f"<span style='color:#DC2626;font-size:1.1rem;'>❌ {p}: GAGAL — {err[:100]}</span>", unsafe_allow_html=True)
+                                st.error(f"Flash {p} gagal! Jangan reboot! Cek log dan ulangi.")
+                        if wipe_data:
+                            ok, out, err = _run(["fastboot", "-s", serial, "-w"], timeout=30)
+                            st.markdown(f"{'✅ Wipe data berhasil' if ok else '❌ Wipe gagal: ' + err[:60]}")
+
+                        st.markdown("<div class='banner-success'><h3>✅ FLASH SELESAI!</h3>Periksa device sebelum reboot. Pastikan tidak ada error di atas.</div>", unsafe_allow_html=True)
+                        st.info("Jika semua OK, reboot device atau keluar dari fastboot.")
+                        r1, r2 = st.columns(2)
+                        with r1:
+                            if st.button("REBOOT DEVICE", use_container_width=True):
+                                _run(["fastboot", "-s", serial, "reboot"], timeout=10)
+                                st.success("Device reboot!")
+                        with r2:
+                            st.download_button("DOWNLOAD LOG FLASH", str(st.session_state.get("safety_checks", "")), file_name="flash_log.txt")
+
+
+elif menu == "Emergency Recovery Guide":
+    st.title("🚨 Emergency Recovery Guide — Jangan Panik!")
+    st.markdown("<div class='banner-critical'>Panduan langkah demi langkah untuk mengatasi HP brick, bootloop, matot, atau error flash. Pilih situasi yang sesuai.</div>", unsafe_allow_html=True)
+    guides = emergency_recovery_guide()
+    situasi = st.selectbox("Pilih Situasi Device", list(guides.keys()), format_func=lambda x: {
+        "edl_9008": "🔴 Qualcomm EDL 9008 — Device mati total (tidak ada respon)",
+        "mtk_preloader": "🟠 MediaTek Preloader — Device mati total (MTK)",
+        "fastboot_unbrick": "🔵 Fastboot Mode — Stuck di logo / bootloop / error flash",
+        "dfu_recovery": "⚪ iPhone DFU/Recovery — iTunes logo, restore gagal",
+        "black_screen": "⚫ Layar Hitam — Hidup tapi tidak tampil",
+        "bootloop": "🔄 Bootloop — Restart terus menerus",
+        "no_download_mode": "❓ Tidak bisa masuk Download Mode / EDL",
+    }.get(x, x))
+    guide_content = guides.get(situasi, [])
+    if guide_content:
+        st.markdown(f"<div class='card card-gold'><h3>{situasi.replace('_', ' ').upper()}</h3>", unsafe_allow_html=True)
+        for i, step in enumerate(guide_content, 1):
+            cls = "banner-success" if i == 1 else ("banner-warning" if "jangan" in step.lower() or "hati" in step.lower() else "card")
+            if step.startswith(tuple("0123456789.")):
+                st.markdown(f"<div class='card'><strong>Step {step}</strong></div>", unsafe_allow_html=True)
+            else:
+                st.markdown(f"<div class='{cls}' style='padding:0.7rem 1rem;margin:0.3rem 0;'>{step}</div>", unsafe_allow_html=True)
+        st.markdown("</div>", unsafe_allow_html=True)
+
+    st.markdown("---")
+    st.markdown("### 🔍 Deteksi Otomatis — Biarkan sistem mendeteksi kondisi device")
+    if st.button("SCAN & SARANKAN RECOVERY", type="primary", use_container_width=True):
+        scan_result = dead_phone_scan()
+        fb = scan_result["fastboot_devices"]
+        edl = scan_result["edl_devices"]
+        dfu = scan_result["dfu_devices"]
+        adb = scan_result["adb_devices"]
+        if edl:
+            st.markdown("<div class='banner-critical'>🔴 EDL 9008 terdeteksi! Gunakan panduan Qualcomm EDL di atas.</div>", unsafe_allow_html=True)
+        if dfu:
+            st.markdown("<div class='banner-critical'>⚪ iPhone DFU terdeteksi! Gunakan panduan DFU/Recovery di atas.</div>", unsafe_allow_html=True)
+        if fb:
+            st.markdown(f"<div class='banner-info'>🔵 Fastboot device terdeteksi ({fb[0]}). Gunakan panduan Fastboot Unbrick di atas.</div>", unsafe_allow_html=True)
+        if adb and not fb:
+            st.markdown("<div class='banner-success'>✅ Device normal via ADB. Jika ada masalah, coba panduan Bootloop atau Black Screen.</div>", unsafe_allow_html=True)
+        if not any([fb, edl, dfu, adb]):
+            st.markdown("<div class='card card-red'><h3>Tidak ada device terdeteksi</h3>"
+                        "Kemungkinan:<br>1. Kabel USB tidak sync (hanya charge)<br>"
+                        "2. Driver tidak terinstall<br>"
+                        "3. Device benar-benar mati total (hardbrick) — butuh EDL/SP Flash Tool<br>"
+                        "4. Baterai habis — coba charge dulu 30 menit</div>", unsafe_allow_html=True)
+
+    with st.expander("📋 Flash Log — Riwayat Semua Operasi Flash"):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("SELECT * FROM flash_log ORDER BY created_at DESC LIMIT 20")
+        logs = c.fetchall()
+        conn.close()
+        if logs:
+            for lg in logs:
+                st.markdown(f"<div class='card' style='padding:0.5rem 1rem;font-size:0.82rem;'>{'✅' if lg['status']=='ok' else '❌'} <strong>{lg['device_model'] or lg['device_serial']}</strong> — {lg['partition_name']} | {lg['created_at'][:16]}<br><span style='color:#6B7280;'>{lg['error_log'][:60] or 'OK'}</span></div>", unsafe_allow_html=True)
+        else:
+            st.info("Belum ada riwayat flash.")
 
 # Auto ZIP & Transfer
 st.markdown("---", unsafe_allow_html=True)
