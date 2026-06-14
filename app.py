@@ -60,7 +60,18 @@ def init_database():
         ampere_reading REAL DEFAULT 0.0, voltage_reading REAL DEFAULT 0.0,
         kondisi TEXT DEFAULT 'mati_total', severity TEXT DEFAULT 'unknown',
         diagnosis TEXT DEFAULT '', rekomendasi TEXT DEFAULT '',
+        service_status TEXT DEFAULT 'check_in', teknisi TEXT DEFAULT '',
         created_at TEXT NOT NULL DEFAULT (datetime('now','localtime')))""")
+
+    # Tambah kolom service_status jika belum ada (migrasi DB lama)
+    try:
+        c.execute("ALTER TABLE pelanggan ADD COLUMN service_status TEXT DEFAULT 'check_in'")
+    except:
+        pass
+    try:
+        c.execute("ALTER TABLE pelanggan ADD COLUMN teknisi TEXT DEFAULT ''")
+    except:
+        pass
 
     c.execute("""CREATE TABLE IF NOT EXISTS inventory_sparepart (
         id INTEGER PRIMARY KEY AUTOINCREMENT, nama TEXT NOT NULL,
@@ -203,19 +214,56 @@ def init_database():
         ]
         c.executemany("INSERT INTO testpoint_guides (chipset_brand,chipset_model,platform,mode_type,description,koordinat,difficulty,image_url) VALUES(?,?,?,?,?,?,?,?)", seed_tp)
 
+    # Indexes untuk performa
+    for idx_sql in [
+        "CREATE INDEX IF NOT EXISTS idx_pelanggan_created ON pelanggan(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_pelanggan_status ON pelanggan(service_status)",
+        "CREATE INDEX IF NOT EXISTS idx_pelanggan_model ON pelanggan(device_model)",
+        "CREATE INDEX IF NOT EXISTS idx_pelanggan_imei ON pelanggan(imei)",
+        "CREATE INDEX IF NOT EXISTS idx_log_service_status ON log_service(status)",
+        "CREATE INDEX IF NOT EXISTS idx_log_service_created ON log_service(created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_stock ON inventory_sparepart(stock)",
+        "CREATE INDEX IF NOT EXISTS idx_inventory_kategori ON inventory_sparepart(kategori)",
+        "CREATE INDEX IF NOT EXISTS idx_flash_log_serial ON flash_log(device_serial)",
+        "CREATE INDEX IF NOT EXISTS idx_backup_log_serial ON backup_log(device_serial)",
+        "CREATE INDEX IF NOT EXISTS idx_adb_scan_serial ON adb_scan_log(serial)",
+        "CREATE INDEX IF NOT EXISTS idx_testpoint_chipset ON testpoint_guides(chipset_brand,mode_type)",
+    ]:
+        try:
+            c.execute(idx_sql)
+        except:
+            pass
+
     conn.commit()
     conn.close()
+
+ADB_ERROR_HINTS = {
+    "device unauthorized": "HP belum di-authorize! Buka HP → izinkan USB Debugging (centang 'Always allow')",
+    "device offline": "HP terdeteksi tapi offline. Coba cabut-colok USB lagi",
+    "no devices/emulators found": "Tidak ada HP terdeteksi. Pastikan USB Debugging ON dan kabel data sync",
+    "insufficient permissions": "Izin USB kurang. Jalankan: adb kill-server && adb start-server && adb root",
+    "not found": "Perintah tidak ditemukan. Install ADB: scoop install adb (Windows) atau download https://developer.android.com/studio/releases/platform-tools",
+    "closed": "Koneksi USB terputus. Coba ganti kabel atau port USB",
+    "unauthorized": "HP belum di-authorize di popup USB Debugging",
+}
 
 def _run(cmd: list, timeout: int = 15) -> tuple:
     try:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.returncode == 0, r.stdout.strip(), r.stderr.strip()
+        ok = r.returncode == 0
+        err = r.stderr.strip()
+        if not ok:
+            for key, hint in ADB_ERROR_HINTS.items():
+                if key in err.lower():
+                    err = f"{err}\n💡 {hint}"
+                    break
+        return ok, r.stdout.strip(), err
     except FileNotFoundError:
-        return False, "", f"Perintah '{cmd[0]}' tidak ditemukan."
+        return False, "", f"❌ Perintah '{cmd[0]}' tidak ditemukan. Install: scoop install adb (Windows) / apt install android-tools-adb (Linux)"
     except subprocess.TimeoutExpired:
-        return False, "", f"Timeout {timeout}s."
+        return False, "", f"⏱ Timeout {timeout}s — HP terlalu lambat merespon. Coba colok ulang USB."
     except Exception as e:
-        return False, "", str(e)
+        return False, "", f"❌ Error: {e}"
 
 
 def adb_devices() -> list:
@@ -227,6 +275,39 @@ def adb_devices() -> list:
             s = line.split("\t")[0].strip()
             if s: devices.append(s)
     return devices
+
+
+def adb_unauthorized() -> list:
+    ok, out, _ = _run(["adb", "devices"], timeout=8)
+    if not ok: return []
+    result = []
+    for line in out.splitlines():
+        if "\tunauthorized" in line:
+            s = line.split("\t")[0].strip()
+            if s: result.append(s)
+    return result
+
+
+def adb_device_status() -> dict:
+    """Returns full device connection status."""
+    ok, out, _ = _run(["adb", "devices"], timeout=8)
+    if not ok: return {"authorized": [], "unauthorized": [], "offline": [], "recovering": []}
+    result = {"authorized": [], "unauthorized": [], "offline": [], "recovering": []}
+    for line in out.splitlines():
+        if "List" in line: continue
+        if "\t" in line:
+            parts = line.split("\t")
+            s = parts[0].strip()
+            status = parts[1].strip() if len(parts) > 1 else ""
+            if status == "device":
+                result["authorized"].append(s)
+            elif status == "unauthorized":
+                result["unauthorized"].append(s)
+            elif status == "offline":
+                result["offline"].append(s)
+            else:
+                result["recovering"].append(s)
+    return result
 
 
 def fastboot_devices() -> list:
@@ -329,6 +410,154 @@ def android_battery_raw(serial: str) -> dict:
     return data
 
 
+def auto_read_ampere_adb(serial: str) -> dict:
+    """Baca ampere langsung dari HP via ADB (dumpsys battery current_now).
+    Returns: {"ampere": float, "source": str, "voltage": float, "detail": str}
+    """
+    result = {"ampere": 0.0, "source": "", "voltage": 0.0, "detail": "Tidak terdeteksi"}
+    ok, out, _ = adb_shell(serial, "dumpsys battery")
+    if not ok:
+        result["detail"] = "Gagal baca dumpsys battery"
+        return result
+    current_now = 0
+    voltage = 0
+    for line in out.splitlines():
+        if "current now:" in line:
+            m = re.search(r'current now:\s*(-?\d+)', line)
+            if m: current_now = int(m.group(1))
+        if "voltage:" in line:
+            m = re.search(r'voltage:\s*(\d+)', line)
+            if m: voltage = int(m.group(1))
+    if current_now == 0:
+        result["detail"] = "Arus 0 — HP mungkin tidak dicharge atau idle"
+        return result
+    ampere_val = abs(current_now) / 1_000_000  # uA to A
+    result["ampere"] = round(ampere_val, 4)
+    result["voltage"] = round(voltage / 1000, 3)
+    result["source"] = f"ADB ({serial[:8]}…)"
+    result["detail"] = f"{ampere_val:.4f}A @ {voltage/1000:.2f}V (via ADB)"
+    return result
+
+
+def _detect_power_meter_serial() -> list:
+    """Cari USB power meter / serial port yang terhubung.
+    Mendukung: FNIRSI FNB58, TC66C, ATORCH, dan power meter generic.
+    Returns: list of {"port": str, "name": str, "vid": str, "pid": str}
+    """
+    import glob
+    found = []
+    patterns = ["/dev/ttyUSB*", "/dev/ttyACM*", "/dev/ttyS[0-9]*", "/dev/ttyAMA*", "/dev/cu.*"]
+    for pat in patterns:
+        for path in glob.glob(pat):
+            if not os.path.exists(path):
+                continue
+            info = {"port": path, "name": "Unknown Power Meter", "vid": "", "pid": ""}
+            try:
+                import subprocess
+                ok, out, _ = _run(["udevadm", "info", "--query=property", path], timeout=3)
+                if ok:
+                    for line in out.splitlines():
+                        if line.startswith("ID_VENDOR="):
+                            info["name"] = line.split("=", 1)[1]
+                        elif line.startswith("ID_MODEL="):
+                            info["name"] += " " + line.split("=", 1)[1]
+                        elif line.startswith("ID_VENDOR_ID="):
+                            info["vid"] = line.split("=", 1)[1]
+                        elif line.startswith("ID_MODEL_ID="):
+                            info["pid"] = line.split("=", 1)[1]
+            except:
+                pass
+            found.append(info)
+    return found
+
+
+POWER_METER_PROFILES = {
+    "f NB58": {"baud": 115200, "parser": "fnirsi"},
+    "fnirsi": {"baud": 115200, "parser": "fnirsi"},
+    "tc66": {"baud": 115200, "parser": "tc66"},
+    "atorch": {"baud": 115200, "parser": "generic"},
+    "rd tech": {"baud": 115200, "parser": "generic"},
+    "dps": {"baud": 115200, "parser": "generic"},
+}
+
+
+def auto_read_ampere_from_power_meter(timeout: float = 2.0) -> dict:
+    """Baca ampere dari USB power meter yang terdeteksi.
+    Returns: {"ampere": float, "source": str, "voltage": float, "detail": str}
+    """
+    result = {"ampere": 0.0, "source": "", "voltage": 0.0, "detail": "Tidak ada power meter"}
+    ports = _detect_power_meter_serial()
+    if not ports:
+        result["detail"] = "Tidak ada USB power meter terdeteksi"
+        return result
+    for p in ports:
+        port_name = p["port"]
+        name_lower = p["name"].lower()
+        baud = 115200
+        for key, profile in POWER_METER_PROFILES.items():
+            if key in name_lower:
+                baud = profile["baud"]
+                break
+        try:
+            import serial
+            with serial.Serial(port_name, baud, timeout=int(timeout)) as ser:
+                ser.reset_input_buffer()
+                ser.write(b"r\r\n")
+                import time as _time
+                _time.sleep(0.3)
+                raw = ser.read(1024).decode("utf-8", errors="ignore")
+                if not raw:
+                    continue
+                lines = raw.strip().split("\n")
+                for line in lines:
+                    parts = line.strip().split(",")
+                    if len(parts) >= 4:
+                        try:
+                            amp = float(parts[2])
+                            volt = float(parts[3])
+                            if 0 < amp < 10:
+                                result["ampere"] = round(amp, 4)
+                                result["voltage"] = round(volt, 3)
+                                result["source"] = f"{p['name']} ({port_name})"
+                                result["detail"] = f"{amp:.4f}A @ {volt:.2f}V (via {port_name})"
+                                return result
+                        except ValueError:
+                            continue
+                    m = re.search(r'([\d.]+)\s*A', line, re.I)
+                    if m:
+                        try:
+                            amp = float(m.group(1))
+                            if 0 < amp < 10:
+                                result["ampere"] = round(amp, 4)
+                                result["source"] = f"{p['name']} ({port_name})"
+                                result["detail"] = f"{amp:.4f}A (via {port_name})"
+                                return result
+                        except ValueError:
+                            continue
+        except Exception:
+            continue
+    result["detail"] = f"Port ditemukan ({len(ports)}) tapi gagal baca data"
+    return result
+
+
+def auto_detect_ampere() -> dict:
+    """Otomatis deteksi ampere dari semua sumber yang tersedia.
+    Priority: Power Meter > ADB
+    Returns: {"ampere": float, "source": str, "voltage": float, "detail": str}
+    """
+    # Priority 1: USB Power Meter
+    meter = auto_read_ampere_from_power_meter()
+    if meter["ampere"] > 0:
+        return meter
+    # Priority 2: ADB
+    adb_devs = adb_devices()
+    if adb_devs:
+        adb_val = auto_read_ampere_adb(adb_devs[0])
+        if adb_val["ampere"] > 0:
+            return adb_val
+    return {"ampere": 0.0, "source": "", "voltage": 0.0, "detail": "Tidak terdeteksi otomatis — isi manual"}
+
+
 def android_battery_capacity(serial: str) -> dict:
     cap = {"current_mah": 0.0, "design_mah": 0.0, "cycle_count": 0, "health_pct": 0.0}
     ok1, out1, _ = adb_shell(serial, "cat /sys/class/power_supply/battery/charge_full")
@@ -399,6 +628,12 @@ def idevice_get_info(udid: str = "") -> dict:
     return info
 
 
+def _safe_float(val, default=0.0):
+    try:
+        return float(val.rstrip('%C')) if isinstance(val, str) else default
+    except (ValueError, AttributeError):
+        return default
+
 def idevice_battery_info(udid: str = "") -> dict:
     bat = {"health_pct": 0.0, "cycle_count": 0, "voltage": 0.0, "temperature": 0.0,
            "current_capacity": 0, "design_capacity": 0, "status": "unknown"}
@@ -412,9 +647,9 @@ def idevice_battery_info(udid: str = "") -> dict:
                 if k == "BatteryCurrentCapacity": bat["current_capacity"] = int(v) if v.isdigit() else 0
                 elif k == "BatteryDesignCapacity": bat["design_capacity"] = int(v) if v.isdigit() else 0
                 elif k == "BatteryCycleCount": bat["cycle_count"] = int(v) if v.isdigit() else 0
-                elif k == "BatteryHealthPercentage": bat["health_pct"] = float(v.rstrip('%')) if '%' in v else (float(v) if v else 0)
-                elif k == "BatteryVoltage": bat["voltage"] = float(v) if v else 0.0
-                elif k == "BatteryTemperature": bat["temperature"] = float(v.rstrip('C')) if 'C' in v else (float(v) if v else 0.0)
+                elif k == "BatteryHealthPercentage": bat["health_pct"] = _safe_float(v)
+                elif k == "BatteryVoltage": bat["voltage"] = _safe_float(v)
+                elif k == "BatteryTemperature": bat["temperature"] = _safe_float(v)
                 elif k == "BatteryStatus": bat["status"] = v
         if bat["health_pct"] == 0 and bat["design_capacity"] > 0 and bat["current_capacity"] > 0:
             bat["health_pct"] = round((bat["current_capacity"]/bat["design_capacity"])*100, 2)
@@ -480,7 +715,7 @@ def network_scan(subnet: str = "") -> list:
     return results
 
 
-def firmare_urls(model: str, chipset: str = "", platform: str = "android") -> list:
+def firmware_urls(model: str, chipset: str = "", platform: str = "android") -> list:
     query = model.replace(" ", "+")
     urls = [("Google Search", f"https://www.google.com/search?q={query}+stock+rom+firmware+download+free"),
             ("Firmware27 (Indonesia)", f"https://firmware27.com/?s={model.replace(' ', '-')}"),
@@ -570,7 +805,7 @@ def generate_battery_status_text(health_pct: float, cycle_count: int, platform: 
         lines.append("iPhone akan throttle performa jika health < 80%.")
     if cycle_count > 800:
         lines.append(f"Siklus {cycle_count} >800 — kapasitas turun signifikan. Segera ganti baterai.")
-    elif platform == "ios" and cycle_count > 500:
+    if platform == "ios" and cycle_count > 500 and cycle_count <= 800:
         lines.append(f"Siklus {cycle_count} — pertimbangkan ganti baterai.")
     if health_pct < 70 and cycle_count < 300:
         lines.append("Health rendah tapi cycle sedikit — kemungkinan cacat pabrik.")
@@ -745,7 +980,8 @@ def copy_to_sdcard():
     if not os.path.exists(ZIP_PATH): return False, "File ZIP belum ada."
     for dest in ["/sdcard/Download/","/storage/emulated/0/Download/","/mnt/sdcard/Download/","/data/media/0/Download/"]:
         try:
-            if os.system(f"cp '{ZIP_PATH}' '{dest}' 2>/dev/null") == 0:
+            subprocess.run(["cp", ZIP_PATH, dest], capture_output=True, timeout=10)
+            if os.path.exists(os.path.join(dest, ZIP_NAME)):
                 return True, f"Tersimpan di {dest}{ZIP_NAME}"
         except: pass
     try:
@@ -1000,7 +1236,7 @@ def detect_device_for_flash() -> dict:
         info["detected"] = True
         info["sources"].append("dfu")
     if info["detected"]:
-        info["firmware_urls"] = firmare_urls(info["model"], info["chipset"])
+        info["firmware_urls"] = firmware_urls(info["model"], info["chipset"])
     return info
 
 
@@ -1042,53 +1278,52 @@ def verify_firmware_file(filepath: str, device_info: dict) -> dict:
                 result["checks"].append(f"firmware_structure:PASS ({fw_count}/4 indicators)")
             else:
                 result["checks"].append(f"firmware_structure:WEAK ({fw_count}/4 indicators)")
-            if model:
-                model_slugs = model.replace(" ", "").replace("-", "").lower()
-                name_text = " ".join(names)
-                chipset_slugs = chipset.replace(" ", "").replace("-", "").lower()
-                model_match = 0
-                if model_slugs and re.search(re.escape(model_slugs[:8]), name_text, re.I):
-                    model_match = 1
-                elif model_slugs and re.search(re.escape(model_slugs[:6]), name_text, re.I):
-                    model_match = 1
-                    score += 5
-                if model_match:
-                    score += 30
-                    result["checks"].append(f"model_match:PASS (model terdeteksi di dalam file)")
-                else:
-                    if has_updater:
-                        try:
-                            us = zf.read([n for n in zf.namelist() if "updater-script" in n.lower()][0]).decode("utf-8", errors="ignore")
-                            m = re.search(r'getprop\("ro\.product\.device"\)\s*==\s*"(\w+)"', us)
-                            if m:
-                                detected_model = m.group(1)
-                                if model_slugs and (detected_model.lower() in model_slugs or model_slugs[:6] in detected_model.lower()):
-                                    score += 30
-                                    result["checks"].append(f"model_updater:PASS ({detected_model})")
-                                else:
-                                    result["checks"].append(f"model_updater:WRONG ({detected_model} ≠ {model[:20]})")
-                        except:
-                            result["checks"].append(f"model_updater:SKIP")
-                    result["checks"].append(f"model_match:WARN (model '{model[:20]}' tidak ditemukan di file)")
-            if chipset_slugs and len(chipset_slugs) > 3:
-                if chipset_slugs in name_text:
-                    score += 10
-                    result["checks"].append(f"chipset_match:PASS")
-            has_fastboot_img = any(n.endswith((".img", ".bin")) and "boot" in n for n in names)
-            has_system_img = any("system" in n and n.endswith((".img", ".new", ".dat")) for n in names)
-            if has_fastboot_img:
+        model_slugs = model.replace(" ", "").replace("-", "").lower() if model else ""
+        name_text = " ".join(names)
+        chipset_slugs = chipset.replace(" ", "").replace("-", "").lower() if chipset else ""
+        model_match = 0
+        if model_slugs:
+            if re.search(re.escape(model_slugs[:8]), name_text, re.I):
+                model_match = 1
+            elif re.search(re.escape(model_slugs[:6]), name_text, re.I):
+                model_match = 1
+            if model_match:
+                score += 30
+                result["checks"].append(f"model_match:PASS (model terdeteksi di dalam file)")
+            else:
+                if has_updater:
+                    try:
+                        us = zf.read([n for n in zf.namelist() if "updater-script" in n.lower()][0]).decode("utf-8", errors="ignore")
+                        m = re.search(r'getprop\("ro\.product\.device"\)\s*==\s*"(\w+)"', us)
+                        if m:
+                            detected_model = m.group(1)
+                            if (detected_model.lower() in model_slugs or model_slugs[:6] in detected_model.lower()):
+                                score += 30
+                                result["checks"].append(f"model_updater:PASS ({detected_model})")
+                            else:
+                                result["checks"].append(f"model_updater:WRONG ({detected_model} ≠ {model[:20]})")
+                    except:
+                        result["checks"].append(f"model_updater:SKIP")
+                result["checks"].append(f"model_match:WARN (model '{model[:20]}' tidak ditemukan di file)")
+        if chipset_slugs and len(chipset_slugs) > 3:
+            if chipset_slugs in name_text:
                 score += 10
-            if has_system_img:
-                score += 10
-            try:
-                for n in zf.namelist():
-                    bn = os.path.basename(n).lower()
-                    for ext in [".img", ".bin", ".dat"]:
-                        if bn.endswith(ext):
-                            break
-            except:
-                pass
-            result["detected_model"] = detected_model
+                result["checks"].append(f"chipset_match:PASS")
+        has_fastboot_img = any(n.endswith((".img", ".bin")) and "boot" in n for n in names)
+        has_system_img = any("system" in n and n.endswith((".img", ".new", ".dat")) for n in names)
+        if has_fastboot_img:
+            score += 10
+        if has_system_img:
+            score += 10
+        try:
+            for n in zf.namelist():
+                bn = os.path.basename(n).lower()
+                for ext in [".img", ".bin", ".dat"]:
+                    if bn.endswith(ext):
+                        break
+        except:
+            pass
+        result["detected_model"] = detected_model
     except Exception as e:
         result["reason"] = f"Error membaca ZIP: {e}"
         result["checks"].append(f"zip_read:FAIL ({e})")
@@ -1158,9 +1393,16 @@ def check_battery_level(serial: str) -> dict:
 
 def check_usb_stability(serial: str, retries: int = 3) -> dict:
     results = []
+    is_adb = serial in adb_devices()
+    is_fastboot = serial in fastboot_devices() if not is_adb else False
     for i in range(retries):
         t1 = time.time()
-        ok, _, _ = _run(["adb", "-s", serial, "get-state"] if serial in adb_devices() else ["fastboot", "-s", serial, "getvar", "battery-voltage"], timeout=5)
+        if is_adb:
+            ok, _, _ = _run(["adb", "-s", serial, "get-state"], timeout=5)
+        elif is_fastboot:
+            ok, _, _ = _run(["fastboot", "-s", serial, "getvar", "battery-voltage"], timeout=5)
+        else:
+            ok = False
         t2 = time.time()
         results.append({"ok": ok, "latency_ms": round((t2 - t1) * 1000)})
     success_rate = sum(1 for r in results if r["ok"]) / len(results)
@@ -1171,6 +1413,7 @@ def check_usb_stability(serial: str, retries: int = 3) -> dict:
 
 def pre_flash_safety_check(serial: str, mode: str = "adb") -> dict:
     checks = []
+    device_model = adb_getprop(serial, "ro.product.model") if mode == "adb" else ""
     battery = check_battery_level(serial)
     checks.append({"name": "Battery Level", "pass": battery["ok"], "detail": battery["detail"]})
     if mode == "adb":
@@ -1180,7 +1423,7 @@ def pre_flash_safety_check(serial: str, mode: str = "adb") -> dict:
     checks.append({"name": f"Device Connected ({mode})", "pass": serial in devs, "detail": f"Device {serial}: {'TERDETEKSI' if serial in devs else 'HILANG!'}"})
     adb_bootloader = adb_getprop(serial, "ro.boot.bootloader") if mode == "adb" else fastboot_getvar(serial, "version-bootloader")
     checks.append({"name": "Bootloader Detected", "pass": bool(adb_bootloader), "detail": f"Bootloader: {adb_bootloader or 'Tidak terdeteksi'}"})
-    arb_result = get_arb_level(serial)
+    arb_result = get_arb_level(device_model or serial)
     checks.append({"name": "Anti-Rollback Check", "pass": arb_result["level"] < 7, "detail": f"ARB Level: {arb_result['level']} — {arb_result['note']}"})
     all_pass = all(c["pass"] for c in checks)
     for c in checks:
@@ -1298,20 +1541,70 @@ st.markdown("""<style>
 
 with st.sidebar:
     st.markdown("""<div class="sidebar-logo"><h2>Smart Service HP</h2><p>Workstation v4.0 — Cross-Platform AI</p></div>""", unsafe_allow_html=True)
+    # Live device status di sidebar
+    _dev_status = adb_device_status()
+    _fb = fastboot_devices()
+    if _dev_status["unauthorized"]:
+        st.markdown(f"<div style='background:#DC2626;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>🔒 **Unauthorized!**<br><small>Buka HP → izinkan USB Debugging</small></div>", unsafe_allow_html=True)
+    if _dev_status["authorized"]:
+        _s = _dev_status["authorized"][0]
+        _m = adb_getprop(_s, "ro.product.model") or _s
+        _a = auto_read_ampere_adb(_s)
+        if _a["ampere"] > 0:
+            st.markdown(f"<div style='background:#1A1A2E;color:#C9A84C;padding:6px 10px;border-radius:6px;font-size:0.8rem;margin-bottom:4px;font-weight:bold;'>⚡ **{_a['ampere']:.4f}A** @ {_a['voltage']:.2f}V</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='background:#059669;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>📱 **{_m}**<br><small>ADB: {_s[:12]}…</small></div>", unsafe_allow_html=True)
+    elif _fb:
+        st.markdown(f"<div style='background:#2563EB;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>⚡ Fastboot: {_fb[0][:16]}…</div>", unsafe_allow_html=True)
+    elif not _dev_status["unauthorized"]:
+        st.markdown(f"<div style='background:#4B5563;color:#9CA3AF;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>📵 No device detected</div>", unsafe_allow_html=True)
+
     menu = st.radio("NAVIGASI", [
         "Dashboard", "Dead Phone Scanner", "Deep ADB Scanner (Android)",
         "iOS Scanner (iPhone)", "Network Scan (PC/Laptop)",
         "Check-In & Diagnosis", "Ampere & Baterai",
+        "Manajemen Tiket Service",
         "Pre-Flashing Security", "Recovery & Testpoint Guide",
         "Deep Cache Cleaner", "Auto Backup & Restore",
         "Flash Wizard", "Emergency Recovery Guide",
         "Inventory & Financial", "Cari Firmware"
     ], label_visibility="collapsed")
     st.markdown("<hr style='border-color: #2D2D2D;'>", unsafe_allow_html=True)
+    if st.button("🔄 Refresh Device", use_container_width=True, help="Scan ulang koneksi device"):
+        st.rerun()
     st.markdown("<p style='color: #4B5563; font-size: 0.7rem;'>2026 Smart Service HP<br>AI-Powered Cross-Platform Service</p>", unsafe_allow_html=True)
+
+def _auto_detect_device():
+    """Deteksi device otomatis — ADB, Fastboot, EDL, DFU."""
+    adb = adb_devices()
+    fb = fastboot_devices()
+    usb = detect_usb_devices_linux() if os.name != "nt" else detect_usb_devices_windows()
+    edl = [d for d in usb if "EDL" in d["mode"] or d["pid"] in ["9008", "900e", "ff90", "f004"]]
+    dfu = [d for d in usb if "DFU" in d["mode"] or d["pid"] in ["1227"]]
+    ios = idevice_devices() if check_idevice_installed() else []
+    return {"adb": adb, "fastboot": fb, "edl": edl, "dfu": dfu, "ios": ios}
 
 if menu == "Dashboard":
     st.title("Dashboard")
+    with st.container():
+        dev = _auto_detect_device()
+        _dash_amp = auto_detect_ampere()
+        status_cols = st.columns([1, 1, 1, 1, 1, 1], vertical_alignment="center")
+        status_cols[0].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>{'📱' if dev['adb'] else '📵'}</span><br><small>{'ADB: ' + str(len(dev['adb'])) if dev['adb'] else 'ADB: -'}</small></div>", unsafe_allow_html=True)
+        status_cols[1].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>{'⚡' if dev['fastboot'] else '⚫'}</span><br><small>{'Fastboot: ' + str(len(dev['fastboot'])) if dev['fastboot'] else 'Fastboot: -'}</small></div>", unsafe_allow_html=True)
+        status_cols[2].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>{'🛑' if dev['edl'] else '⚫'}</span><br><small>{'EDL: ' + str(len(dev['edl'])) if dev['edl'] else 'EDL: -'}</small></div>", unsafe_allow_html=True)
+        status_cols[3].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>{'🍎' if dev['ios'] else '⚫'}</span><br><small>{'iOS: ' + str(len(dev['ios'])) if dev['ios'] else 'iOS: -'}</small></div>", unsafe_allow_html=True)
+        status_cols[4].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>{'🔌' if dev['dfu'] else '⚫'}</span><br><small>{'DFU: ' + str(len(dev['dfu'])) if dev['dfu'] else 'DFU: -'}</small></div>", unsafe_allow_html=True)
+        if _dash_amp["ampere"] > 0:
+            status_cols[5].markdown(f"<div class='card' style='text-align:center;padding:0.4rem;background:#1A1A2E;color:#C9A84C;'><span style='font-size:1.2rem;'>⚡</span><br><small><strong>{_dash_amp['ampere']:.4f}A</strong></small></div>", unsafe_allow_html=True)
+        else:
+            status_cols[5].markdown(f"<div class='card' style='text-align:center;padding:0.4rem'><span style='font-size:1.2rem;'>⚫</span><br><small>Ampere: -</small></div>", unsafe_allow_html=True)
+
+        if dev["adb"]:
+            s = dev["adb"][0]
+            model = adb_getprop(s, "ro.product.model")
+            bat = adb_getprop(s, "ro.build.version.release")
+            st.markdown(f"<div class='banner-success'>✅ **Device Terdeteksi:** {model or s} | Android: {bat or '?'} | Serial: {s}</div>", unsafe_allow_html=True)
+
     conn = get_conn(); c = conn.cursor()
     c.execute("SELECT COUNT(*), COALESCE(SUM(biaya_jasa+biaya_sparepart),0) FROM log_service WHERE status='completed'")
     svc_count, svc_rev = c.fetchone()
@@ -1341,17 +1634,33 @@ if menu == "Dashboard":
     col2.markdown(f"<div class='card'><strong>Fastboot:</strong> {'Terinstall' if check_fastboot_installed() else 'Tidak'}</div>", unsafe_allow_html=True)
     col3.markdown(f"<div class='card'><strong>libimobiledevice:</strong> {'Terinstall' if check_idevice_installed() else 'Tidak'}</div>", unsafe_allow_html=True)
     missing = []
-    if not check_adb_installed(): missing.append("android-tools-adb")
-    if not check_fastboot_installed(): missing.append("android-tools-fastboot")
-    if not check_idevice_installed(): missing.append("libimobiledevice-utils")
-    if missing: st.code(f"apt install {' '.join(missing)}", language="bash")
+    if not check_adb_installed(): missing.append("ADB")
+    if not check_fastboot_installed(): missing.append("Fastboot")
+    if not check_idevice_installed(): missing.append("libimobiledevice")
+    if missing:
+        st.warning(f"Tools belum terinstall: {', '.join(missing)}")
+        st.markdown("""
+**Cara install di Windows:**
+- **ADB & Fastboot:** `scoop install adb` atau download [Platform Tools](https://developer.android.com/studio/releases/platform-tools)
+- **libimobiledevice:** Download dari [github.com/libimobiledevice-win32](https://github.com/libimobiledevice-win32/imobiledevice-net/releases)
+        """)
 
 elif menu == "Deep ADB Scanner (Android)":
     st.title("Deep ADB Scanner — Android")
     st.markdown("<p style='color:#6B7280;'>Memindai perangkat Android hingga ke inti: model, chipset, partisi, bootloader, baterai, CPU, MAC address.</p>", unsafe_allow_html=True)
+    if not check_adb_installed():
+        st.markdown("<div class='banner-critical'>❌ ADB tidak terinstall!</div>", unsafe_allow_html=True)
+        st.markdown("Install ADB: `scoop install adb` (Windows) atau download [Platform Tools](https://developer.android.com/studio/releases/platform-tools)")
+    else:
+        auto_devs = adb_devices()
+        if auto_devs:
+            st.markdown(f"<div class='banner-success'>✅ {len(auto_devs)} device terdeteksi! Klik Scan untuk detail.</div>", unsafe_allow_html=True)
+        else:
+            st.markdown("<div class='banner-warning'>⚠️ Belum ada device. Pastikan: 1) USB Debugging ON 2) Kabel data sync 3) Authorized di popup HP</div>", unsafe_allow_html=True)
+
     if st.button("SCAN ADB DEVICES", type="primary", use_container_width=True):
         if not check_adb_installed():
-            st.markdown("<div class='banner-critical'>ADB tidak terinstall. Install: apt install android-tools-adb</div>", unsafe_allow_html=True)
+            st.markdown("<div class='banner-critical'>ADB tidak terinstall. Install: scoop install adb (Windows) / download Platform Tools</div>", unsafe_allow_html=True)
         else:
             with st.spinner("Menjalankan adb devices..."):
                 devices = adb_devices()
@@ -1359,7 +1668,11 @@ elif menu == "Deep ADB Scanner (Android)":
                 st.markdown(f"<div class='banner-success'>{len(devices)} device terdeteksi!</div>", unsafe_allow_html=True)
                 for serial in devices:
                     with st.spinner(f"Deep scanning {serial}..."):
-                        info = deep_scan_android(serial)
+                        try:
+                            info = deep_scan_android(serial)
+                        except Exception as e:
+                            st.error(f"Scan gagal: {e}")
+                            continue
                     st.markdown(f"""<div class='card card-gold'><h3>Device: {info['model'] or 'Unknown'}</h3>
                         <table style='width:100%;font-size:0.9rem;'>
                         <tr><td style='color:#6B7280;width:180px;'>Serial</td><td><strong>{info['serial']}</strong></td></tr>
@@ -1385,7 +1698,7 @@ elif menu == "Deep ADB Scanner (Android)":
                     sto = info["storage"]
                     if sto["total_gb"] > 0: st.markdown(f"""<div class='card'><h3>Penyimpanan</h3><table style='width:100%;font-size:0.9rem;'><tr><td style='color:#6B7280;width:180px;'>Total</td><td>{sto['total_gb']} GB</td></tr><tr><td>Terpakai</td><td>{sto['used_gb']} GB</td></tr><tr><td>Sisa</td><td><strong>{sto['free_gb']} GB ({sto['free_percent']}%)</strong></td></tr></table></div>""", unsafe_allow_html=True)
                     st.markdown(f"### Link Firmware untuk {info['model']}")
-                    for src, url in firmare_urls(info['model'], info['chipset']): st.markdown(f"- [{src}]({url})")
+                    for src, url in firmware_urls(info['model'], info['chipset']): st.markdown(f"- [{src}]({url})")
                     if info["partitions"]:
                         with st.expander("Partisi Sistem"): st.code("\n".join(info["partitions"]), language="text")
                     parts_detail = android_partitions_detail(serial)
@@ -1408,7 +1721,7 @@ elif menu == "iOS Scanner (iPhone)":
     st.markdown("<p style='color:#6B7280;'>Memindai perangkat iOS via libimobiledevice. Data riil: model, iOS version, serial, activation lock, UDID.</p>", unsafe_allow_html=True)
     if not check_idevice_installed():
         st.markdown("<div class='banner-critical'>libimobiledevice tidak terinstall.</div>", unsafe_allow_html=True)
-        st.code("apt install libimobiledevice-utils", language="bash")
+        st.markdown("Download dari [github.com/libimobiledevice-win32](https://github.com/libimobiledevice-win32/imobiledevice-net/releases)")
     else:
         if st.button("SCAN iOS DEVICES", type="primary", use_container_width=True):
             with st.spinner("Mendeteksi perangkat iOS..."):
@@ -1439,7 +1752,7 @@ elif menu == "iOS Scanner (iPhone)":
                     c.execute("INSERT INTO ios_scan_log (udid,model,ios_version,serial_number,activation_status,battery_health,cycle_count) VALUES(?,?,?,?,?,?,?)", (info['udid'], info['product_type'], info['ios_version'], info['serial_number'], info['activation_status'], bat['health_pct'], bat['cycle_count']))
                     conn.commit(); conn.close()
                     st.markdown("### Link Firmware")
-                    for src, url in firmare_urls(info['product_type'], "", "ios"): st.markdown(f"- [{src}]({url})")
+                    for src, url in firmware_urls(info['product_type'], "", "ios"): st.markdown(f"- [{src}]({url})")
             else: st.markdown("<div class='banner-warning'>Tidak ada perangkat iOS. Jalankan idevicepair pair dulu.</div>", unsafe_allow_html=True)
 
 elif menu == "Network Scan (PC/Laptop)":
@@ -1457,17 +1770,36 @@ elif menu == "Network Scan (PC/Laptop)":
 
 elif menu == "Check-In & Diagnosis":
     st.title("Smart Check-In & Diagnosis")
+    # Auto-detect device
+    _detected_model = ""
+    _detected_platform = "android"
+    _adb_devs = adb_devices()
+    if _adb_devs:
+        _detected_model = adb_getprop(_adb_devs[0], "ro.product.model")
+        st.markdown(f"<div class='banner-success'>✅ Device terdeteksi: {_detected_model or _adb_devs[0]}</div>", unsafe_allow_html=True)
+    elif check_idevice_installed() and idevice_devices():
+        _detected_platform = "ios"
+        st.markdown(f"<div class='banner-success'>✅ iOS device terdeteksi</div>", unsafe_allow_html=True)
+
+    # Auto-detect ampere
+    _auto_amp = auto_detect_ampere()
+    _default_amp = _auto_amp["ampere"]
+    if _auto_amp["ampere"] > 0:
+        st.markdown(f"<div class='banner-info'>⚡ Ampere terdeteksi otomatis: **{_auto_amp['ampere']:.4f}A** ({_auto_amp['source']})</div>", unsafe_allow_html=True)
+    elif _auto_amp["detail"] != "Tidak terdeteksi otomatis — isi manual":
+        st.markdown(f"<div class='card' style='padding:0.4rem 0.8rem;font-size:0.85rem;'>{_auto_amp['detail']}</div>", unsafe_allow_html=True)
+
     with st.form("checkin"):
         col1, col2 = st.columns(2)
         with col1:
             nama = st.text_input("Nama Pelanggan *")
-            device_model = st.text_input("Model HP *", placeholder="Redmi Note 13 / iPhone 11")
+            device_model = st.text_input("Model HP *", value=_detected_model or "", placeholder="Redmi Note 13 / iPhone 11")
             keluhan = st.text_area("Gejala Kerusakan *", placeholder="HP mati total setelah jatuh...")
-            platform = st.selectbox("Platform", ["android", "ios"])
+            platform = st.selectbox("Platform", ["android", "ios"], index=0 if _detected_platform=="android" else 1)
         with col2:
             no_hp = st.text_input("No. HP", placeholder="081234567890")
             imei = st.text_input("IMEI / Serial")
-            ampere = st.number_input("Arus Ampere (Power Supply)", 0.0, 10.0, 0.0, 0.01, format="%.3f")
+            ampere = st.number_input("Arus Ampere (Power Supply)", 0.0, 10.0, _default_amp, 0.01, format="%.4f", help=f"Auto-detect: {_auto_amp['detail']}. Ketik manual jika perlu koreksi.")
             kondisi = st.selectbox("Kondisi HP", ["mati_total — Mati total, belum tekan power", "tekan_power — Sudah tekan tombol power"])
         submitted = st.form_submit_button("DIAGNOSIS SEKARANG", type="primary", use_container_width=True)
     if submitted:
@@ -1493,7 +1825,7 @@ elif menu == "Check-In & Diagnosis":
             with col2: st.markdown(f"<div class='card card-gold'><h3>Diagnosis AI</h3><p style='white-space:pre-wrap;'>{diagnosis}</p></div>", unsafe_allow_html=True)
             st.markdown(f"<div class='card'><h3>Rekomendasi</h3><p style='white-space:pre-wrap;'>{rekomendasi}</p></div>", unsafe_allow_html=True)
             st.markdown("### Link Firmware")
-            for src, url in firmare_urls(device_model, chipset, platform): st.markdown(f"- [{src}]({url})")
+            for src, url in firmware_urls(device_model, chipset, platform): st.markdown(f"- [{src}]({url})")
 
 elif menu == "Ampere & Baterai":
     st.title("Diagnosis Ampere & Battery Health Multi-OS")
@@ -1501,8 +1833,12 @@ elif menu == "Ampere & Baterai":
 
     with tab1:
         st.markdown("Masukkan nilai arus untuk diagnosis Android.")
+        _amp_auto = auto_detect_ampere()
+        _amp_default = _amp_auto["ampere"] if _amp_auto["ampere"] > 0 else 0.02
+        if _amp_auto["ampere"] > 0:
+            st.markdown(f"<div class='banner-info' style='font-size:0.85rem;padding:0.4rem 1rem;'>⚡ Auto: {_amp_auto['ampere']:.4f}A ({_amp_auto['source']})</div>", unsafe_allow_html=True)
         with st.form("amp_form"):
-            amp = st.number_input("Arus (A)", 0.0, 10.0, 0.02, 0.001, format="%.3f")
+            amp = st.number_input("Arus (A)", 0.0, 10.0, _amp_default, 0.001, format="%.4f", help=f"Auto-detect: {_amp_auto['detail']}")
             kond = st.selectbox("Kondisi", ["mati_total", "tekan_power"])
             if st.form_submit_button("Analisis", type="primary"):
                 d, s, r = diagnose_ampere(amp, kond, "android")
@@ -1539,12 +1875,16 @@ elif menu == "Ampere & Baterai":
 
     with tab3:
         st.markdown("### Diagnosis Ampere untuk iPhone/iPad")
+        _amp_ios = auto_detect_ampere()
+        _amp_ios_def = _amp_ios["ampere"] if _amp_ios["ampere"] > 0 else 0.02
+        if _amp_ios["ampere"] > 0:
+            st.markdown(f"<div class='banner-info' style='font-size:0.85rem;padding:0.4rem 1rem;'>⚡ Auto: {_amp_ios['ampere']:.4f}A ({_amp_ios['source']})</div>", unsafe_allow_html=True)
         with st.form("ios_amp_form"):
-            amp_ios = st.number_input("Arus iPhone (A)", 0.0, 10.0, 0.02, 0.001, format="%.3f", key="ios_amp")
+            amp_ios = st.number_input("Arus iPhone (A)", 0.0, 10.0, _amp_ios_def, 0.001, format="%.4f", key="ios_amp", help=f"Auto: {_amp_ios['detail']}")
             kond_ios = st.selectbox("Kondisi iPhone", ["mati_total", "tekan_power"], key="ios_kond")
             if st.form_submit_button("Analisis iPhone", type="primary"):
                 d, s, r = diagnose_ampere(amp_ios, kond_ios, "ios")
-                st.markdown(f"<div style='text-align:center'><strong>SEVERITY: {s.upper()}</strong></div>")
+                st.markdown(f"<div style='text-align:center'><strong>SEVERITY: {s.upper()}</strong></div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='card card-gold'><p style='white-space:pre-wrap;'>{d}</p></div>", unsafe_allow_html=True)
                 st.markdown(f"<div class='card'><p style='white-space:pre-wrap;'>{r}</p></div>", unsafe_allow_html=True)
 
@@ -1614,7 +1954,7 @@ elif menu == "Pre-Flashing Security":
 
     with tab2:
         st.markdown("### iPhone Activation Lock Check")
-        if not check_idevice_installed(): st.markdown("<div class='banner-critical'>libimobiledevice tidak terinstall.</div>", unsafe_allow_html=True); st.code("apt install libimobiledevice-utils", language="bash")
+        if not check_idevice_installed(): st.markdown("<div class='banner-critical'>libimobiledevice tidak terinstall.</div>", unsafe_allow_html=True); st.markdown("Download: [github.com/libimobiledevice-win32](https://github.com/libimobiledevice-win32/imobiledevice-net/releases)")
         elif st.button("CEK ACTIVATION LOCK", type="primary"):
             udids = idevice_devices()
             if udids:
@@ -1682,7 +2022,7 @@ elif menu == "Deep Cache Cleaner":
         devs = adb_devices()
         if not devs:
             st.markdown("<div class='banner-warning'>Tidak ada device via ADB.</div>", unsafe_allow_html=True)
-            if not check_adb_installed(): st.code("apt install android-tools-adb", language="bash")
+            if not check_adb_installed(): st.markdown("Install: `scoop install adb` (Windows) / [Platform Tools](https://developer.android.com/studio/releases/platform-tools)")
         else:
             serial = devs[0]
             st.markdown(f"<div class='banner-success'>Device: {serial}</div>", unsafe_allow_html=True)
@@ -1829,7 +2169,7 @@ elif menu == "Cari Firmware":
     with col2: chipset_fw = st.text_input("Chipset (opsional)", placeholder="Snapdragon 685")
     if model_fw:
         st.markdown(f"### Hasil untuk: {model_fw}")
-        for src, url in firmare_urls(model_fw, chipset_fw):
+        for src, url in firmware_urls(model_fw, chipset_fw):
             st.markdown(f"<div class='card' style='padding:0.6rem 1rem;'><strong style='color:#2563EB;'>{src}</strong><br><a href='{url}' target='_blank' style='color:#6B7280;word-break:break-all;'>{url}</a></div>", unsafe_allow_html=True)
         arb = get_arb_level(model_fw)
         if arb["level"] >= 7: st.markdown(f"<div class='banner-critical'>ARB LEVEL {arb['level']} — DILARANG DOWNGRADE!</div>", unsafe_allow_html=True)
@@ -2164,15 +2504,25 @@ elif menu == "Flash Wizard":
                             st.code(f"fastboot -s {serial} -w")
                         st.success("Dry run selesai. Matikan centang 'Dry Run' di Safety Checklist untuk flash nyata.")
                     else:
-                        for p in parts_to_flash:
-                            st.markdown(f"Flashing `{p}`...")
-                            ok, out, err = _run(["fastboot", "-s", serial, "flash", p, fw_path] if fw_path.endswith(".img") else ["fastboot", "-s", serial, "update", fw_path], timeout=120)
-                            log_flash_transaction(serial, dev_info.get("model", ""), p, fw_path, True, "ok" if ok else "failed", err)
+                        if fw_path.endswith(".zip"):
+                            st.markdown(f"Flashing firmware `{os.path.basename(fw_path)}`...")
+                            ok, out, err = _run(["fastboot", "-s", serial, "update", fw_path], timeout=120)
+                            log_flash_transaction(serial, dev_info.get("model", ""), "full_zip", fw_path, True, "ok" if ok else "failed", err)
                             if ok:
-                                st.markdown(f"<span style='color:#059669;font-size:1.1rem;'>✅ {p}: FLASH BERHASIL</span>", unsafe_allow_html=True)
+                                st.markdown(f"<span style='color:#059669;font-size:1.1rem;'>✅ FIRMWARE FLASH BERHASIL</span>", unsafe_allow_html=True)
                             else:
-                                st.markdown(f"<span style='color:#DC2626;font-size:1.1rem;'>❌ {p}: GAGAL — {err[:100]}</span>", unsafe_allow_html=True)
-                                st.error(f"Flash {p} gagal! Jangan reboot! Cek log dan ulangi.")
+                                st.markdown(f"<span style='color:#DC2626;font-size:1.1rem;'>❌ FLASH GAGAL — {err[:100]}</span>", unsafe_allow_html=True)
+                                st.error("Flash firmware gagal! Jangan reboot! Cek log.")
+                        else:
+                            for p in parts_to_flash:
+                                st.markdown(f"Flashing `{p}`...")
+                                ok, out, err = _run(["fastboot", "-s", serial, "flash", p, fw_path], timeout=120)
+                                log_flash_transaction(serial, dev_info.get("model", ""), p, fw_path, True, "ok" if ok else "failed", err)
+                                if ok:
+                                    st.markdown(f"<span style='color:#059669;font-size:1.1rem;'>✅ {p}: FLASH BERHASIL</span>", unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"<span style='color:#DC2626;font-size:1.1rem;'>❌ {p}: GAGAL — {err[:100]}</span>", unsafe_allow_html=True)
+                                    st.error(f"Flash {p} gagal! Jangan reboot! Cek log dan ulangi.")
                         if wipe_data:
                             ok, out, err = _run(["fastboot", "-s", serial, "-w"], timeout=30)
                             st.markdown(f"{'✅ Wipe data berhasil' if ok else '❌ Wipe gagal: ' + err[:60]}")
@@ -2247,15 +2597,191 @@ elif menu == "Emergency Recovery Guide":
         else:
             st.info("Belum ada riwayat flash.")
 
-# Auto ZIP & Transfer
+elif menu == "Manajemen Tiket Service":
+    st.title("Manajemen Tiket Service")
+    st.markdown("<p style='color:#6B7280;'>Kelola siklus hidup tiket service: Check-In → Diagnosed → Repair → QC → Ready → Delivered</p>", unsafe_allow_html=True)
+
+    # Filter & Search
+    col_f1, col_f2, col_f3 = st.columns([1, 1, 2])
+    with col_f1:
+        filter_status = st.selectbox("Filter Status", [
+            "Semua", "check_in", "diagnosed", "repair", "qc", "ready", "delivered"
+        ])
+    with col_f2:
+        limit_count = st.selectbox("Tampilkan", [20, 50, 100, 999])
+    with col_f3:
+        search_q = st.text_input("Cari (nama/IMEI/model/no.HP)", placeholder="Ketik keyword...")
+
+    conn = get_conn()
+    c = conn.cursor()
+    query = "SELECT * FROM pelanggan WHERE 1=1"
+    params = []
+    if filter_status != "Semua":
+        query += " AND service_status = ?"
+        params.append(filter_status)
+    if search_q:
+        like = f"%{search_q}%"
+        query += " AND (nama LIKE ? OR imei LIKE ? OR device_model LIKE ? OR no_hp LIKE ?)"
+        params += [like, like, like, like]
+    query += " ORDER BY created_at DESC LIMIT ?"
+    params.append(limit_count)
+    c.execute(query, params)
+    records = c.fetchall()
+    conn.close()
+
+    if not records:
+        st.info("Belum ada data tiket service.")
+    else:
+        st.markdown(f"<div style='margin-bottom:0.5rem;color:#9CA3AF;'>Menampilkan {len(records)} tiket</div>", unsafe_allow_html=True)
+        status_emoji = {"check_in": "📥", "diagnosed": "🔍", "repair": "🔧", "qc": "✅", "ready": "📦", "delivered": "🎯"}
+        status_colors = {
+            "check_in": "#3B82F6", "diagnosed": "#8B5CF6", "repair": "#F59E0B",
+            "qc": "#10B981", "ready": "#6366F1", "delivered": "#6B7280"
+        }
+        next_status = {
+            "check_in": "diagnosed", "diagnosed": "repair", "repair": "qc",
+            "qc": "ready", "ready": "delivered", "delivered": None
+        }
+
+        for rec in records:
+            s = rec["service_status"] or "check_in"
+            emoji = status_emoji.get(s, "📋")
+            color = status_colors.get(s, "#6B7280")
+            next_s = next_status.get(s)
+            with st.container():
+                cols = st.columns([3, 1, 1, 1, 1, 1])
+                with cols[0]:
+                    st.markdown(f"<div style='border-left:4px solid {color};padding-left:0.5rem;'><strong>{rec['nama']}</strong> — {rec['device_model']}<br><span style='color:#6B7280;font-size:0.82rem;'>IMEI: {rec['imei'] or '-'} | Tgl: {rec['created_at'][:16]}</span></div>", unsafe_allow_html=True)
+                with cols[1]:
+                    st.markdown(f"<div style='background:{color}20;color:{color};padding:0.2rem 0.6rem;border-radius:12px;text-align:center;font-weight:bold;font-size:0.8rem;'>{emoji} {s.upper()}</div>", unsafe_allow_html=True)
+                with cols[2]:
+                    if next_s:
+                        if st.button(f"→ {next_s.title()}", key=f"next_{rec['id']}", use_container_width=True):
+                            conn = get_conn()
+                            c = conn.cursor()
+                            c.execute("UPDATE pelanggan SET service_status = ? WHERE id = ?", (next_s, rec["id"]))
+                            conn.commit()
+                            conn.close()
+                            st.rerun()
+                with cols[3]:
+                    with st.popover("Detail", use_container_width=True):
+                        st.markdown(f"**ID:** {rec['id']}")
+                        st.markdown(f"**Nama:** {rec['nama']}")
+                        st.markdown(f"**No.HP:** {rec['no_hp'] or '-'}")
+                        st.markdown(f"**Model:** {rec['device_model']}")
+                        st.markdown(f"**IMEI:** {rec['imei'] or '-'}")
+                        st.markdown(f"**Keluhan:** {rec['keluhan']}")
+                        st.markdown(f"**Arus:** {rec['ampere_reading']}A / {rec['voltage_reading']}V")
+                        st.markdown(f"**Diagnosis:** {rec['diagnosis'] or '-'}")
+                        st.markdown(f"**Status:** {s.upper()}")
+                        st.markdown(f"**Teknisi:** {rec.get('teknisi','') or '-'}")
+                        st.markdown(f"**Tgl:** {rec['created_at']}")
+                with cols[4]:
+                    with st.popover("Edit", use_container_width=True):
+                        new_nama = st.text_input("Nama", value=rec["nama"], key=f"en_{rec['id']}")
+                        new_hp = st.text_input("No.HP", value=rec["no_hp"] or "", key=f"eh_{rec['id']}")
+                        new_model = st.text_input("Model", value=rec["device_model"], key=f"em_{rec['id']}")
+                        new_imei = st.text_input("IMEI", value=rec["imei"] or "", key=f"ei_{rec['id']}")
+                        new_keluhan = st.text_area("Keluhan", value=rec["keluhan"], key=f"ek_{rec['id']}")
+                        new_teknisi = st.text_input("Teknisi", value=rec.get("teknisi","") or "", key=f"et_{rec['id']}")
+                        if st.button("Simpan", key=f"save_{rec['id']}", use_container_width=True):
+                            conn = get_conn()
+                            c = conn.cursor()
+                            c.execute("UPDATE pelanggan SET nama=?, no_hp=?, device_model=?, imei=?, keluhan=?, teknisi=? WHERE id=?",
+                                      (new_nama, new_hp, new_model, new_imei, new_keluhan, new_teknisi, rec["id"]))
+                            conn.commit()
+                            conn.close()
+                            st.rerun()
+                with cols[5]:
+                    if st.button("Hapus", key=f"del_{rec['id']}", use_container_width=True, type="secondary"):
+                        conn = get_conn()
+                        c = conn.cursor()
+                        c.execute("DELETE FROM pelanggan WHERE id=?", (rec["id"],))
+                        conn.commit()
+                        conn.close()
+                        st.rerun()
+            st.markdown("<hr style='margin:0.3rem 0;border-color:#2D2D2D;'>", unsafe_allow_html=True)
+
+    with st.expander("📊 Statistik Tiket"):
+        conn = get_conn()
+        c = conn.cursor()
+        c.execute("""SELECT service_status, COUNT(*) as cnt FROM pelanggan GROUP BY service_status ORDER BY cnt DESC""")
+        stats = c.fetchall()
+        conn.close()
+        if stats:
+            col_s1, col_s2, col_s3, col_s4, col_s5, col_s6 = st.columns(6)
+            stat_map = {r["service_status"]: r["cnt"] for r in stats}
+            for s_name, emoji in status_emoji.items():
+                cnt = stat_map.get(s_name, 0)
+                clr = status_colors.get(s_name, "#6B7280")
+                idx = list(status_emoji.keys()).index(s_name)
+            for idx, (s_name, emoji) in enumerate(status_emoji.items()):
+                cnt = stat_map.get(s_name, 0)
+                clr = status_colors.get(s_name, "#6B7280")
+                [col_s1, col_s2, col_s3, col_s4, col_s5, col_s6][idx].markdown(
+                    f"<div style='background:{clr}15;border:1px solid {clr};border-radius:8px;padding:0.5rem;text-align:center;'>"
+                    f"<div style='font-size:1.5rem;'>{emoji}</div>"
+                    f"<div style='font-size:1.2rem;font-weight:bold;color:{clr};'>{cnt}</div>"
+                    f"<div style='font-size:0.7rem;color:#9CA3AF;'>{s_name.replace('_',' ').title()}</div></div>",
+                    unsafe_allow_html=True
+                )
+
+    with st.expander("🖨️ Invoice / Nota Service — Cetak PDF"):
+        inv_id = st.text_input("ID Tiket untuk cetak nota", placeholder="Masukkan ID...")
+        if inv_id and inv_id.isdigit():
+            conn = get_conn()
+            c = conn.cursor()
+            c.execute("SELECT * FROM pelanggan WHERE id=?", (int(inv_id),))
+            inv = c.fetchone()
+            conn.close()
+            if inv:
+                st.markdown(f"""
+                <div style='background:white;color:black;padding:2rem;border-radius:8px;max-width:400px;margin:auto;font-family:monospace;'>
+                <h2 style='text-align:center;'>NOTA SERVICE</h2>
+                <hr>
+                <p><strong>No:</strong> INV-{inv['id']:04d}</p>
+                <p><strong>Tgl:</strong> {inv['created_at'][:16]}</p>
+                <p><strong>Pelanggan:</strong> {inv['nama']}</p>
+                <p><strong>No.HP:</strong> {inv.get('no_hp','') or '-'}</p>
+                <p><strong>Device:</strong> {inv['device_model']}</p>
+                <p><strong>IMEI:</strong> {inv['imei'] or '-'}</p>
+                <p><strong>Keluhan:</strong> {inv['keluhan']}</p>
+                <p><strong>Diagnosis:</strong> {inv['diagnosis'] or '-'}</p>
+                <p><strong>Status:</strong> {inv.get('service_status','check_in').replace('_',' ').title()}</p>
+                <hr>
+                <p style='text-align:center;font-size:0.8rem;'>Terima kasih telah menggunakan layanan kami</p>
+                </div>
+                """, unsafe_allow_html=True)
+                inv_html = f"""
+                <div style='background:white;color:black;padding:2rem;border-radius:8px;max-width:400px;margin:auto;font-family:monospace;'>
+                <h2 style='text-align:center;'>NOTA SERVICE</h2>
+                <hr>
+                <p><strong>No:</strong> INV-{inv['id']:04d}</p>
+                <p><strong>Tgl:</strong> {inv['created_at'][:16]}</p>
+                <p><strong>Pelanggan:</strong> {inv['nama']}</p>
+                <p><strong>No.HP:</strong> {inv.get('no_hp','') or '-'}</p>
+                <p><strong>Device:</strong> {inv['device_model']}</p>
+                <p><strong>IMEI:</strong> {inv['imei'] or '-'}</p>
+                <p><strong>Keluhan:</strong> {inv['keluhan']}</p>
+                <p><strong>Diagnosis:</strong> {inv['diagnosis'] or '-'}</p>
+                <p><strong>Status:</strong> {inv.get('service_status','check_in').replace('_',' ').title()}</p>
+                <hr>
+                <p style='text-align:center;font-size:0.8rem;'>Terima kasih telah menggunakan layanan kami</p>
+                </div>
+                """
+                st.download_button("📥 Download HTML Nota", data=inv_html, file_name=f"nota_{inv['id']:04d}.html", mime="text/html", use_container_width=True)
+            else:
+                st.error("Tiket tidak ditemukan")
+
+# Auto ZIP & Transfer — hanya sekali per session
 st.markdown("---", unsafe_allow_html=True)
 st.markdown("<div style='text-align:center;color:#9CA3AF;font-size:0.75rem;'>Smart Service HP Workstation v4.0 | Cross-Platform Multi-OS | 2026</div>", unsafe_allow_html=True)
 
-_zip_ok, _zip_msg = create_zip()
-_copy_ok = False; _copy_msg = ""
-if _zip_ok:
-    _copy_ok, _copy_msg = copy_to_sdcard()
 if "_zip_notified" not in st.session_state:
     st.session_state._zip_notified = True
+    _zip_ok, _zip_msg = create_zip()
+    _copy_ok = False; _copy_msg = ""
+    if _zip_ok:
+        _copy_ok, _copy_msg = copy_to_sdcard()
     if _zip_ok: st.toast(f"{ZIP_NAME} berhasil dibuat!", icon="check")
     if _copy_ok: st.toast(f"{_copy_msg}", icon="phone")

@@ -1,0 +1,14 @@
+# Smart Service HP Workstation - Dependencies
+# Core
+streamlit>=1.28.0        # Opsional: untuk GUI web-based
+rich>=13.0.0             # CLI: tabel & output warna yang rapi
+dataclasses              # Built-in Python 3.7+, fallback
+
+# Database
+# SQLite3 built-in, no extra package needed
+
+# Serial / USB Power Meter
+pyserial>=3.5            # USB Power Meter (FNIRSI, TC66C, ATORCH)
+
+# ADB
+# subprocess built-in, no extra package needed
