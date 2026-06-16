@@ -307,7 +307,7 @@ def get_ampere_rule(ampere: float, condition: str) -> Dict:
     cursor.execute("""
         SELECT * FROM ampere_rules
         WHERE ? >= min_ampere AND ? <= max_ampere
-          AND condition_note LIKE '%' || ? || '%'
+          AND ? LIKE '%' || condition_note || '%'
         ORDER BY priority DESC
         LIMIT 1
     """, (ampere, ampere, condition))

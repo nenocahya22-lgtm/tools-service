@@ -14,12 +14,9 @@ import shutil
 import os
 import re
 import zipfile
-import webbrowser
 import time
-import json
-from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional
-from dataclasses import dataclass, field
+from datetime import datetime
+from typing import Tuple
 from pathlib import Path
 
 try:
@@ -27,6 +24,15 @@ try:
     HAS_PLOTLY = True
 except ImportError:
     HAS_PLOTLY = False
+
+try:
+    from core.hardware_diagnosis import (
+        diagnose_usb_flapping, diagnose_emmc, diagnose_ram,
+        diagnose_wifi_bt, diagnose_baseband, diagnose_all, generate_diagnosis_report
+    )
+    HAS_HW_DIAG = True
+except ImportError:
+    HAS_HW_DIAG = False
 
 st.set_page_config(
     page_title="Smart Service HP Workstation v4",
@@ -66,11 +72,11 @@ def init_database():
     # Tambah kolom service_status jika belum ada (migrasi DB lama)
     try:
         c.execute("ALTER TABLE pelanggan ADD COLUMN service_status TEXT DEFAULT 'check_in'")
-    except:
+    except Exception:
         pass
     try:
         c.execute("ALTER TABLE pelanggan ADD COLUMN teknisi TEXT DEFAULT ''")
-    except:
+    except Exception:
         pass
 
     c.execute("""CREATE TABLE IF NOT EXISTS inventory_sparepart (
@@ -231,7 +237,7 @@ def init_database():
     ]:
         try:
             c.execute(idx_sql)
-        except:
+        except Exception:
             pass
 
     conn.commit()
@@ -465,7 +471,7 @@ def _detect_power_meter_serial() -> list:
                             info["vid"] = line.split("=", 1)[1]
                         elif line.startswith("ID_MODEL_ID="):
                             info["pid"] = line.split("=", 1)[1]
-            except:
+            except Exception:
                 pass
             found.append(info)
     return found
@@ -696,7 +702,7 @@ def network_scan(subnet: str = "") -> list:
     status_text = st.empty()
     for i in range(1, 255):
         ip = f"{base}.{i}"
-        ok, out, _ = _run(["ping", "-c", "1", "-W", "1", ip], timeout=3)
+        ok, _, _ = _run(["ping", "-c", "1", "-W", "1", ip], timeout=3)
         if ok:
             h_ok, host_out, _ = _run(["hostname", ip], timeout=3) if shutil.which("hostname") else (False,"","")
             hostname = host_out.strip() if h_ok and host_out else ""
@@ -983,11 +989,11 @@ def copy_to_sdcard():
             subprocess.run(["cp", ZIP_PATH, dest], capture_output=True, timeout=10)
             if os.path.exists(os.path.join(dest, ZIP_NAME)):
                 return True, f"Tersimpan di {dest}{ZIP_NAME}"
-        except: pass
+        except Exception: pass
     try:
         subprocess.run(["adb","push",ZIP_PATH,"/sdcard/Download/"], capture_output=True, text=True, timeout=15)
         return True, f"Terkirim via ADB ke /sdcard/Download/{ZIP_NAME}"
-    except: pass
+    except Exception: pass
     return False, "Tidak dapat menyalin. /sdcard tidak tersedia."
 
 
@@ -1121,14 +1127,6 @@ def backup_partition_fastboot(serial: str, partition: str, output_dir: str) -> d
     out_path = os.path.join(output_dir, f"{partition}.img")
     ok, out, err = _run(["fastboot", "-s", serial, "flash:raw", out_path, partition], timeout=30)
     if not ok:
-        ok2, out2, err2 = _run(["fastboot", "-s", serial, "getvar", f"partition-size:{partition}"], timeout=10)
-        s_m = re.search(r'partition-size:\s*(\w+)', out2, re.I)
-        if s_m:
-            sz = int(s_m.group(1), 16)
-            ok3, out3, _ = _run(["fastboot", "-s", serial, "getvar", f"partition-type:{partition}"], timeout=5)
-            typ = out3.strip()
-        else:
-            sz = 0
         return {"partition": partition, "file": "", "size_bytes": 0, "sha256": "", "status": "failed", "error": err}
     sha = sha256_file(out_path)
     sz = os.path.getsize(out_path) if os.path.exists(out_path) else 0
@@ -1267,10 +1265,8 @@ def verify_firmware_file(filepath: str, device_info: dict) -> dict:
             names = [n.lower() for n in zf.namelist()]
             has_img = any(n.endswith(".img") for n in names)
             has_bin = any(n.endswith(".bin") for n in names)
-            has_xml = any(n.endswith(".xml") for n in names)
             has_updater = any("updater-script" in n for n in names)
             has_android_info = any("android-info" in n for n in names)
-            has_build_prop = any("build.prop" in n for n in names)
             firmware_indicators = [has_img, has_bin, has_updater, has_android_info]
             fw_count = sum(firmware_indicators)
             if fw_count >= 2:
@@ -1302,7 +1298,7 @@ def verify_firmware_file(filepath: str, device_info: dict) -> dict:
                                 result["checks"].append(f"model_updater:PASS ({detected_model})")
                             else:
                                 result["checks"].append(f"model_updater:WRONG ({detected_model} ≠ {model[:20]})")
-                    except:
+                    except Exception:
                         result["checks"].append(f"model_updater:SKIP")
                 result["checks"].append(f"model_match:WARN (model '{model[:20]}' tidak ditemukan di file)")
         if chipset_slugs and len(chipset_slugs) > 3:
@@ -1313,17 +1309,9 @@ def verify_firmware_file(filepath: str, device_info: dict) -> dict:
         has_system_img = any("system" in n and n.endswith((".img", ".new", ".dat")) for n in names)
         if has_fastboot_img:
             score += 10
-        if has_system_img:
-            score += 10
-        try:
-            for n in zf.namelist():
-                bn = os.path.basename(n).lower()
-                for ext in [".img", ".bin", ".dat"]:
-                    if bn.endswith(ext):
-                        break
-        except:
-            pass
-        result["detected_model"] = detected_model
+            if has_system_img:
+                score += 10
+            result["detected_model"] = detected_model
     except Exception as e:
         result["reason"] = f"Error membaca ZIP: {e}"
         result["checks"].append(f"zip_read:FAIL ({e})")
@@ -1378,7 +1366,7 @@ def check_battery_level(serial: str) -> dict:
                 info["ok"] = info["level"] >= SAFETY_RULES["battery_min_pct"]["android"]
                 info["detail"] = f"Baterai: {info['level']}% — {'OK' if info['ok'] else 'ISI DULU!'}"
                 return info
-    except:
+    except Exception:
         pass
     try:
         ok, out, _ = _run(["fastboot", "-s", serial, "getvar", "battery-voltage"], timeout=5)
@@ -1386,7 +1374,7 @@ def check_battery_level(serial: str) -> dict:
             info["detail"] = "Device di Fastboot — voltase terdeteksi"
             info["ok"] = True
             return info
-    except:
+    except Exception:
         pass
     return info
 
@@ -1515,63 +1503,117 @@ def log_flash_transaction(serial: str, model: str, partition: str, firmware: str
 init_database()
 
 st.markdown("""<style>
-    .stApp { background-color: #FAFAF8; }
-    .main > div { padding: 1rem 1.5rem; }
-    h1, h2, h3 { color: #1A1A1A !important; font-weight: 700 !important; letter-spacing: -0.02em; }
+    :root {
+        --bg-primary: #FAFAF8;
+        --bg-card: #FFFFFF;
+        --bg-sidebar: #1A1A1A;
+        --text-primary: #1A1A1A;
+        --text-secondary: #6B7280;
+        --text-muted: #9CA3AF;
+        --accent-gold: #C9A84C;
+        --accent-blue: #2563EB;
+        --accent-blue-hover: #1D4ED8;
+        --success: #059669;
+        --warning: #D97706;
+        --error: #DC2626;
+    }
+    .stApp { background-color: var(--bg-primary); }
+    .main > div { padding: 1.5rem 2rem; }
+    h1, h2, h3 { color: var(--text-primary) !important; font-weight: 700 !important; letter-spacing: -0.02em; }
     h1 { font-size: 1.75rem !important; } h2 { font-size: 1.35rem !important; }
-    section[data-testid="stSidebar"] { background-color: #1A1A1A; min-width: 260px; }
+    section[data-testid="stSidebar"] { background-color: var(--bg-sidebar); min-width: 260px; }
     section[data-testid="stSidebar"] .stMarkdown { color: #FFFFFF; }
-    .sidebar-logo { padding: 1.5rem 1rem 0.5rem; border-bottom: 1px solid #2D2D2D; margin-bottom: 0.5rem; }
-    .sidebar-logo h2 { color: #C9A84C !important; font-size: 1.2rem; margin: 0; }
-    .sidebar-logo p { color: #6B7280; font-size: 0.75rem; margin: 0.2rem 0 0 0; }
-    section[data-testid="stSidebar"] .stRadio > label { color: #9CA3AF !important; padding: 0.5rem 1rem; border-radius: 6px; }
-    section[data-testid="stSidebar"] .stRadio > label:hover { background: rgba(255,255,255,0.05); color: #FFF !important; }
-    section[data-testid="stSidebar"] .stRadio > label[data-checked="true"] { background: rgba(201,168,76,0.1); border-left: 3px solid #C9A84C; color: #C9A84C !important; }
-    .card { background: #FFF; border: 1px solid #E5E7EB; border-radius: 12px; padding: 1.2rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04); margin-bottom: 0.8rem; }
-    .card-gold { border-left: 4px solid #C9A84C; } .card-blue { border-left: 4px solid #2563EB; }
-    .card-red { border-left: 4px solid #DC2626; } .card-green { border-left: 4px solid #059669; }
+    .sidebar-logo { padding: 1.5rem 1.2rem 0.8rem; border-bottom: 1px solid #2D2D2D; margin-bottom: 1rem; }
+    .sidebar-logo h2 { color: var(--accent-gold) !important; font-size: 1.1rem; margin: 0; letter-spacing: 0.5px; }
+    .sidebar-logo p { color: var(--text-muted); font-size: 0.7rem; margin: 0.2rem 0 0 0; }
+    section[data-testid="stSidebar"] .stRadio { gap: 2px !important; }
+    section[data-testid="stSidebar"] .stRadio > label {
+        color: var(--text-muted) !important; padding: 0.6rem 1.2rem; border-radius: 6px;
+        font-size: 0.85rem; font-weight: 500; margin: 1px 0; border-left: 3px solid transparent;
+        transition: all 0.2s ease;
+    }
+    section[data-testid="stSidebar"] .stRadio > label:hover {
+        background: rgba(255,255,255,0.06); color: #FFF !important;
+    }
+    section[data-testid="stSidebar"] .stRadio > label[data-checked="true"] {
+        background: rgba(201,168,76,0.1); border-left: 3px solid var(--accent-gold); color: var(--accent-gold) !important;
+    }
+    .sidebar-footer { padding: 1rem 1.2rem; border-top: 1px solid #2D2D2D; margin-top: auto; }
+    .section-header { color: #4B5563; font-size: 0.65rem; font-weight: 600; text-transform: uppercase; letter-spacing: 1px; padding: 0.5rem 1.2rem 0.3rem; }
+    .card { background: var(--bg-card); border: 1px solid #E5E7EB; border-radius: 12px; padding: 1.2rem; box-shadow: 0 1px 2px rgba(0,0,0,0.04); margin-bottom: 0.8rem; transition: box-shadow 0.2s ease; }
+    .card:hover { box-shadow: 0 4px 12px rgba(0,0,0,0.08); }
+    .card-gold { border-left: 4px solid var(--accent-gold); }
+    .card-blue { border-left: 4px solid var(--accent-blue); }
+    .card-red { border-left: 4px solid var(--error); }
+    .card-green { border-left: 4px solid var(--success); }
+    .banner-critical { background: linear-gradient(135deg, var(--error), #991B1B); color: white; padding: 0.8rem 1.2rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; font-size: 0.9rem; }
+    .banner-warning { background: linear-gradient(135deg, var(--warning), #92400E); color: white; padding: 0.8rem 1.2rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; font-size: 0.9rem; }
+    .banner-success { background: linear-gradient(135deg, var(--success), #065F46); color: white; padding: 0.8rem 1.2rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; font-size: 0.9rem; }
+    .banner-info { background: linear-gradient(135deg, var(--accent-blue), #1E40AF); color: white; padding: 0.8rem 1.2rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; font-size: 0.9rem; }
     div[data-testid="stMetric"] { background: white; padding: 1rem 1.2rem; border-radius: 12px; box-shadow: 0 1px 3px rgba(0,0,0,0.06); border: 1px solid #E5E7EB; }
-    div[data-testid="stMetric"] label { color: #6B7280 !important; font-weight: 600 !important; font-size: 0.8rem !important; }
-    div[data-testid="stMetric"] div { color: #1A1A1A !important; font-weight: 700 !important; }
-    .banner-critical { background: linear-gradient(135deg, #DC2626, #991B1B); color: white; padding: 1rem 1.5rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; }
-    .banner-warning { background: linear-gradient(135deg, #D97706, #92400E); color: white; padding: 1rem 1.5rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; }
-    .banner-success { background: linear-gradient(135deg, #059669, #065F46); color: white; padding: 1rem 1.5rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; }
-    .banner-info { background: linear-gradient(135deg, #2563EB, #1E40AF); color: white; padding: 1rem 1.5rem; border-radius: 10px; margin: 0.5rem 0; font-weight: 600; }
+    div[data-testid="stMetric"] label { color: var(--text-secondary) !important; font-weight: 600 !important; font-size: 0.8rem !important; }
+    div[data-testid="stMetric"] div { color: var(--text-primary) !important; font-weight: 700 !important; }
+    div[data-testid="stTabs"] button { font-weight: 600; font-size: 0.85rem; }
+    div[data-testid="stTabs"] button[aria-selected="true"] { border-bottom: 2px solid var(--accent-gold); color: var(--accent-gold); }
+    [data-testid="stSidebar"] button[kind="primary"] { background: var(--accent-gold); color: #1A1A1A; font-weight: 600; border: none; }
+    [data-testid="stSidebar"] button[kind="primary"]:hover { background: #B8943A; }
 </style>""", unsafe_allow_html=True)
 
 with st.sidebar:
-    st.markdown("""<div class="sidebar-logo"><h2>Smart Service HP</h2><p>Workstation v4.0 — Cross-Platform AI</p></div>""", unsafe_allow_html=True)
-    # Live device status di sidebar
+    st.markdown("""<div class="sidebar-logo">
+        <h2>✦ Smart Service HP</h2>
+        <p>Workstation v4.0 — AI-Powered</p>
+    </div>""", unsafe_allow_html=True)
     _dev_status = adb_device_status()
     _fb = fastboot_devices()
     if _dev_status["unauthorized"]:
-        st.markdown(f"<div style='background:#DC2626;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>🔒 **Unauthorized!**<br><small>Buka HP → izinkan USB Debugging</small></div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='background:#DC2626;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>🔒 Unauthorized!<br><small>Buka HP → izinkan USB Debugging</small></div>", unsafe_allow_html=True)
     if _dev_status["authorized"]:
         _s = _dev_status["authorized"][0]
         _m = adb_getprop(_s, "ro.product.model") or _s
         _a = auto_read_ampere_adb(_s)
         if _a["ampere"] > 0:
-            st.markdown(f"<div style='background:#1A1A2E;color:#C9A84C;padding:6px 10px;border-radius:6px;font-size:0.8rem;margin-bottom:4px;font-weight:bold;'>⚡ **{_a['ampere']:.4f}A** @ {_a['voltage']:.2f}V</div>", unsafe_allow_html=True)
-        st.markdown(f"<div style='background:#059669;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>📱 **{_m}**<br><small>ADB: {_s[:12]}…</small></div>", unsafe_allow_html=True)
+            st.markdown(f"<div style='background:#1A1A2E;color:#C9A84C;padding:6px 10px;border-radius:6px;font-size:0.8rem;margin-bottom:4px;font-weight:bold;'>⚡ {_a['ampere']:.4f}A @ {_a['voltage']:.2f}V</div>", unsafe_allow_html=True)
+        st.markdown(f"<div style='background:#059669;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>📱 {_m}<br><small>ADB: {_s[:12]}…</small></div>", unsafe_allow_html=True)
     elif _fb:
         st.markdown(f"<div style='background:#2563EB;color:white;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>⚡ Fastboot: {_fb[0][:16]}…</div>", unsafe_allow_html=True)
     elif not _dev_status["unauthorized"]:
         st.markdown(f"<div style='background:#4B5563;color:#9CA3AF;padding:6px 10px;border-radius:6px;font-size:0.75rem;margin-bottom:8px;'>📵 No device detected</div>", unsafe_allow_html=True)
 
-    menu = st.radio("NAVIGASI", [
-        "Dashboard", "Dead Phone Scanner", "Deep ADB Scanner (Android)",
-        "iOS Scanner (iPhone)", "Network Scan (PC/Laptop)",
-        "Check-In & Diagnosis", "Ampere & Baterai",
-        "Manajemen Tiket Service",
-        "Pre-Flashing Security", "Recovery & Testpoint Guide",
-        "Deep Cache Cleaner", "Auto Backup & Restore",
-        "Flash Wizard", "Emergency Recovery Guide",
-        "Inventory & Financial", "Cari Firmware"
-    ], label_visibility="collapsed")
-    st.markdown("<hr style='border-color: #2D2D2D;'>", unsafe_allow_html=True)
+    menu = "Dashboard"
+    _submenu_options = {
+        "📊 Dashboard": ["Dashboard"],
+        "🔧 Service": ["Check-In & Diagnosis", "Manajemen Tiket Service", "Ampere & Baterai", "Hardware Diagnosis (Windows)"],
+        "📱 Device Scanner": ["Deep ADB Scanner (Android)", "iOS Scanner (iPhone)", "Dead Phone Scanner", "Network Scan (PC/Laptop)"],
+        "🛠️ Repair Tools": ["Flash Wizard", "Auto Backup & Restore", "Pre-Flashing Security", "Recovery & Testpoint Guide", "Emergency Recovery Guide", "Deep Cache Cleaner"],
+        "📦 Inventory & Finance": ["Inventory & Financial", "Cari Firmware"],
+    }
+    _categories = list(_submenu_options.keys())
+    st.markdown("<div class='section-header'>Navigasi</div>", unsafe_allow_html=True)
+    category = st.radio("KATEGORI", _categories, label_visibility="collapsed")
+
+    if "_submenu_init" not in st.session_state:
+        st.session_state["_submenu_init"] = True
+        for cat, opts in _submenu_options.items():
+            st.session_state[f"_submenu_{cat}"] = opts[0]
+
+    if category == "📊 Dashboard":
+        menu = "Dashboard"
+    else:
+        _opts = _submenu_options[category]
+        _key = f"_submenu_{category}"
+        _saved = st.session_state.get(_key, _opts[0])
+        if _saved in _opts:
+            _idx = _opts.index(_saved)
+        else:
+            _idx = 0
+        menu = st.selectbox("", _opts, index=_idx, label_visibility="collapsed", key=_key)
+        st.markdown(f"<div style='color:#C9A84C;font-size:0.65rem;padding:2px 0 4px 4px;'>▸ {category.split()[1]} {_opts.index(menu)+1}/{len(_opts)}</div>", unsafe_allow_html=True)
+
+    st.markdown("<hr style='border-color:#2D2D2D;margin:0.8rem 0;'>", unsafe_allow_html=True)
     if st.button("🔄 Refresh Device", use_container_width=True, help="Scan ulang koneksi device"):
         st.rerun()
-    st.markdown("<p style='color: #4B5563; font-size: 0.7rem;'>2026 Smart Service HP<br>AI-Powered Cross-Platform Service</p>", unsafe_allow_html=True)
+    st.markdown("<p style='color:#4B5563;font-size:0.7rem;padding:0 1.2rem;'>© 2026 Smart Service HP<br>AI-Powered Cross-Platform</p>", unsafe_allow_html=True)
 
 def _auto_detect_device():
     """Deteksi device otomatis — ADB, Fastboot, EDL, DFU."""
@@ -2029,7 +2071,8 @@ elif menu == "Deep Cache Cleaner":
             sto = android_storage_info(serial)
             if sto["total_gb"] > 0: st.markdown(f"<div class='card'><h3>Penyimpanan Sebelum</h3>Total: {sto['total_gb']} GB | Terpakai: {sto['used_gb']} GB | Sisa: <strong>{sto['free_gb']} GB ({sto['free_percent']}%)</strong></div>", unsafe_allow_html=True)
 
-            if st.button("CLEAN ALL (Deep)", type="primary", use_container_width=True):
+            clean_confirm = st.text_input("Ketik 'CLEAN' lalu tekan CLEAN ALL untuk konfirmasi:", placeholder="CLEAN", key="clean_confirm")
+            if st.button("CLEAN ALL (Deep)", type="primary", use_container_width=True, disabled=(clean_confirm != "CLEAN")):
                 with st.spinner("Membersihkan..."):
                     res = android_clean_cache(serial)
                 st.markdown(f"<div class='card card-green'><h3>Pembersihan Selesai!</h3><strong>Ruang diselamatkan: {res['total_saved_mb']} MB</strong><br>Tindakan: {len(res['actions'])} berhasil | {len(res['errors'])} error</div>", unsafe_allow_html=True)
@@ -2477,9 +2520,15 @@ elif menu == "Flash Wizard":
                 help="Hapus semua data pengguna setelah flash berhasil.")
 
             if "vbmeta" in parts_to_flash:
-                st.markdown("<div class='banner-critical'>⚠️ VBMETA TERPILIH! Hanya centang jika bootloader UNLOCKED. Jika LOCKED, flashing vbmeta bisa hardbrick!</div>", unsafe_allow_html=True)
+                bl_status = fastboot_getvar(serial, "unlocked") if serial in fastboot_devices() else ""
+                bl_unlocked = bl_status in ["yes", "1"]
+                if not bl_unlocked:
+                    st.markdown("<div class='banner-critical'>🚫 VBMETA DIPILIH TAPI BOOTLOADER TERKUNCI! Flashing vbmeta pada bootloader LOCKED akan menyebabkan HARDBRICK! Hapus centangan vbmeta.</div>", unsafe_allow_html=True)
+                    parts_to_flash = [p for p in parts_to_flash if p != "vbmeta"]
+                else:
+                    st.markdown("<div class='banner-warning'>⚠️ VBMETA terpilih — bootloader UNLOCKED, aman.</div>", unsafe_allow_html=True)
             if "super" in parts_to_flash:
-                st.warning("⚠️ 'super' partition mengandung system/vendor/product. Pastikan firmware cocok 100%!")
+                st.markdown("<div class='banner-critical'>⚠️ 'super' partition mengandung system/vendor/product. Pastikan firmware cocok 100%! Kesalahan bisa menyebabkan hardbrick!</div>", unsafe_allow_html=True)
 
             if not st.session_state.get("backup_done"):
                 st.warning("Backup dulu sebelum flash!")
@@ -2597,6 +2646,182 @@ elif menu == "Emergency Recovery Guide":
         else:
             st.info("Belum ada riwayat flash.")
 
+elif menu == "Hardware Diagnosis (Windows)":
+    if not HAS_HW_DIAG:
+        st.error("Modul hardware_diagnosis tidak tersedia. Periksa file core/hardware_diagnosis.py")
+        st.stop()
+    st.title("Hardware Diagnosis — Windows Detection")
+    st.markdown("""
+    <p style='color:#6B7280;'>
+    Mendeteksi kerusakan hardware HP melalui koneksi Windows — tanpa membuka perangkat.
+    Diagnosis berdasarkan USB handshake, log flashing, BROM error, dan Kernel log.
+    </p>
+    """, unsafe_allow_html=True)
+
+    tab_hw1, tab_hw2, tab_hw3, tab_hw4, tab_hw5 = st.tabs([
+        "🔌 IC Charger", "💾 eMMC/UFS", "🧠 RAM", "📶 Wi-Fi/BT", "📡 Baseband"
+    ])
+
+    with tab_hw1:
+        st.markdown("<h3>🔌 IC Charger & Jalur Pengisian Daya</h3>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='card card-blue'>
+        <strong>Prinsip:</strong> Windows mendeteksi koneksi perangkat yang flapping (connect/disconnect) setiap 1-2 detik.
+        <br><strong>Indikasi:</strong> IC Charger (SMB/PMI) rusak, thermal resistor putus, atau konektor USB longgar.
+        </div>
+        """, unsafe_allow_html=True)
+        col_c1, col_c2 = st.columns([2, 1])
+        with col_c1:
+            usb_input = st.text_area(
+                "Tempel log USB/device manager di sini (satu baris per event):",
+                height=120, placeholder="USB Device Connected\nUSB Device Disconnected\nUSB Device Connected...",
+                key="hw_usb_log"
+            )
+        with col_c2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Diagnosis Charging", type="primary", use_container_width=True, key="diag_charging"):
+                if usb_input.strip():
+                    events = [l.strip() for l in usb_input.strip().split("\n") if l.strip()]
+                    res = diagnose_usb_flapping(events)
+                    if res.status == "faulty":
+                        st.markdown(f"<div class='banner-critical'>🔴 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Confidence:** {res.confidence}%")
+                        st.markdown(f"**Tindakan:**<br>{res.recommended_action}")
+                    elif res.status == "suspect":
+                        st.markdown(f"<div class='banner-warning'>🟡 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div class='banner-success'>✅ {res.component} — Tidak terdeteksi flapping</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("Masukkan log USB terlebih dahulu.")
+
+    with tab_hw2:
+        st.markdown("<h3>💾 eMMC / UFS (Memori Internal)</h3>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='card card-blue'>
+        <strong>Prinsip:</strong> HP terbaca sebagai Qualcomm 9008 / MediaTek USB Port, tapi flash/transfer file gagal (timeout/write error).
+        <br><strong>Indikasi:</strong> IC eMMC/UFS rusak total. CPU dan IC Power sehat.
+        </div>
+        """, unsafe_allow_html=True)
+        col_m1, col_m2 = st.columns([2, 1])
+        with col_m1:
+            flash_log_input = st.text_area(
+                "Tempel log flashing di sini:",
+                height=120, placeholder="[ERROR] Flash timeout at sector 0x1234\nWrite error: EIO\nSahara protocol error...",
+                key="hw_emmc_log"
+            )
+        with col_m2:
+            edl_detected = st.checkbox("Device terdeteksi di EDL 9008 / Preloader Mode", key="hw_edl")
+            if st.button("Diagnosis eMMC", type="primary", use_container_width=True, key="diag_emmc"):
+                if flash_log_input.strip():
+                    lines = [l.strip() for l in flash_log_input.strip().split("\n") if l.strip()]
+                    res = diagnose_emmc(lines)
+                    if res.status == "faulty":
+                        st.markdown(f"<div class='banner-critical'>🔴 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Confidence:** {res.confidence}%")
+                        st.markdown(f"**Tindakan:**<br>{res.recommended_action}")
+                    elif res.status == "suspect":
+                        st.markdown(f"<div class='banner-warning'>🟡 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                    else:
+                        st.markdown(f"<div class='banner-success'>✅ {res.component} — Tidak terdeteksi error flash</div>", unsafe_allow_html=True)
+                elif edl_detected:
+                    st.markdown(f"<div class='banner-warning'>🟡 eMMC mencurigakan — device dalam mode EDL</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("Masukkan log flashing atau centang EDL detected.")
+
+    with tab_hw3:
+        st.markdown("<h3>🧠 RAM (Random Access Memory)</h3>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='card card-blue'>
+        <strong>Prinsip:</strong> CPU terdeteksi oleh PC, tapi log BROM mencatat RAM_INIT_FAILED atau S_FT_ENABLE_DRAM_FAIL.
+        <br><strong>Indikasi:</strong> Solderan RAM retak (double decker) — perlu reball.
+        </div>
+        """, unsafe_allow_html=True)
+        col_r1, col_r2 = st.columns([2, 1])
+        with col_r1:
+            brom_input = st.text_area(
+                "Tempel BROM / SP Flash Tool log di sini:",
+                height=120,
+                placeholder="BROM_ERROR: S_FT_ENABLE_DRAM_FAIL\n[ERROR] RAM init failed at step 3\nDRAM initialization error code: 0xC005",
+                key="hw_ram_log"
+            )
+        with col_r2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Diagnosis RAM", type="primary", use_container_width=True, key="diag_ram"):
+                if brom_input.strip():
+                    lines = [l.strip() for l in brom_input.strip().split("\n") if l.strip()]
+                    res = diagnose_ram(lines)
+                    if res.status == "faulty":
+                        st.markdown(f"<div class='banner-critical'>🔴 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Confidence:** {res.confidence}%")
+                        st.markdown(f"**Tindakan:**<br>{res.recommended_action}")
+                    else:
+                        st.markdown(f"<div class='banner-success'>✅ {res.component} — Tidak terdeteksi error RAM</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("Masukkan BROM log.")
+
+    with tab_hw4:
+        st.markdown("<h3>📶 IC Wi-Fi / Bluetooth</h3>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='card card-blue'>
+        <strong>Prinsip:</strong> HP bootloop (stuck di logo). Kernel UART log mencatat wlan_init_failed atau wcnss: chip initialization failed.
+        <br><strong>Indikasi:</strong> IC Wi-Fi/BT rusak atau short. CPU stop boot karena komponen tidak responsif.
+        </div>
+        """, unsafe_allow_html=True)
+        col_w1, col_w2 = st.columns([2, 1])
+        with col_w1:
+            kernel_input = st.text_area(
+                "Tempel Kernel UART log di sini:",
+                height=150,
+                placeholder="[    3.456] wlan: wlan_init_failed: chip not responding\n[    3.789] wcnss: WCNSS chip initialization failed\n[    4.012] wl: failed to probe wlan driver",
+                key="hw_wifi_log"
+            )
+        with col_w2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Diagnosis Wi-Fi/BT", type="primary", use_container_width=True, key="diag_wifi"):
+                if kernel_input.strip():
+                    res = diagnose_wifi_bt(kernel_input)
+                    if res.status == "faulty":
+                        st.markdown(f"<div class='banner-critical'>🔴 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Confidence:** {res.confidence}%")
+                        st.markdown(f"**Tindakan:**<br>{res.recommended_action}")
+                        with st.expander("Bukti log"):
+                            st.code(res.evidence)
+                    else:
+                        st.markdown(f"<div class='banner-success'>✅ Tidak terdeteksi error Wi-Fi/BT</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("Masukkan Kernel log.")
+
+    with tab_hw5:
+        st.markdown("<h3>📡 IC Baseband / IC Sinyal</h3>", unsafe_allow_html=True)
+        st.markdown("""
+        <div class='card card-blue'>
+        <strong>Prinsip:</strong> Log sistem mencatat modem_silent_reset, subsys-restart: RAFT, atau modem init failure.
+        <br><strong>Indikasi:</strong> Tegangan suplai IC Baseband pincang atau IC sinyal rusak.
+        </div>
+        """, unsafe_allow_html=True)
+        col_b1, col_b2 = st.columns([2, 1])
+        with col_b1:
+            modem_input = st.text_area(
+                "Tempel log modem/baseband di sini:",
+                height=120,
+                placeholder="modem_silent_reset: triggered\nsubsys-restart: RAFT subsystem crash\n[ERROR] Modem initialization failed",
+                key="hw_modem_log"
+            )
+        with col_b2:
+            st.markdown("<br>", unsafe_allow_html=True)
+            if st.button("Diagnosis Baseband", type="primary", use_container_width=True, key="diag_baseband"):
+                if modem_input.strip():
+                    lines = [l.strip() for l in modem_input.strip().split("\n") if l.strip()]
+                    res = diagnose_baseband(lines)
+                    if res.status == "faulty":
+                        st.markdown(f"<div class='banner-critical'>🔴 {res.component}<br>{res.diagnosis}</div>", unsafe_allow_html=True)
+                        st.markdown(f"**Confidence:** {res.confidence}%")
+                        st.markdown(f"**Tindakan:**<br>{res.recommended_action}")
+                    else:
+                        st.markdown(f"<div class='banner-success'>✅ Tidak terdeteksi error baseband</div>", unsafe_allow_html=True)
+                else:
+                    st.warning("Masukkan log modem.")
+
 elif menu == "Manajemen Tiket Service":
     st.title("Manajemen Tiket Service")
     st.markdown("<p style='color:#6B7280;'>Kelola siklus hidup tiket service: Check-In → Diagnosed → Repair → QC → Ready → Delivered</p>", unsafe_allow_html=True)
@@ -2693,13 +2918,17 @@ elif menu == "Manajemen Tiket Service":
                             conn.close()
                             st.rerun()
                 with cols[5]:
-                    if st.button("Hapus", key=f"del_{rec['id']}", use_container_width=True, type="secondary"):
-                        conn = get_conn()
-                        c = conn.cursor()
-                        c.execute("DELETE FROM pelanggan WHERE id=?", (rec["id"],))
-                        conn.commit()
-                        conn.close()
-                        st.rerun()
+                    with st.popover("Hapus", use_container_width=True):
+                        st.error("⚠️ Data akan dihapus PERMANEN!")
+                        st.caption(f"Tiket #{rec['id']}: {rec['nama']} — {rec['device_model']}")
+                        confirm = st.checkbox("Saya yakin ingin menghapus", key=f"conf_{rec['id']}")
+                        if confirm and st.button("Ya, Hapus!", key=f"del_{rec['id']}", use_container_width=True):
+                            conn = get_conn()
+                            c = conn.cursor()
+                            c.execute("DELETE FROM pelanggan WHERE id=?", (rec["id"],))
+                            conn.commit()
+                            conn.close()
+                            st.rerun()
             st.markdown("<hr style='margin:0.3rem 0;border-color:#2D2D2D;'>", unsafe_allow_html=True)
 
     with st.expander("📊 Statistik Tiket"):
@@ -2709,12 +2938,7 @@ elif menu == "Manajemen Tiket Service":
         stats = c.fetchall()
         conn.close()
         if stats:
-            col_s1, col_s2, col_s3, col_s4, col_s5, col_s6 = st.columns(6)
             stat_map = {r["service_status"]: r["cnt"] for r in stats}
-            for s_name, emoji in status_emoji.items():
-                cnt = stat_map.get(s_name, 0)
-                clr = status_colors.get(s_name, "#6B7280")
-                idx = list(status_emoji.keys()).index(s_name)
             for idx, (s_name, emoji) in enumerate(status_emoji.items()):
                 cnt = stat_map.get(s_name, 0)
                 clr = status_colors.get(s_name, "#6B7280")
